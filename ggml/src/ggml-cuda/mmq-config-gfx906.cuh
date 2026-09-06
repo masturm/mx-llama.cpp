@@ -9,11 +9,12 @@
 // (mmq.cuh), which holds J<=64 for row-sharded (-sm tensor) and MoE shapes and
 // lets full-row shapes (1-GPU, -sm layer) take the wider tile.
 //
-// IQ* types: same treatment as Q8_0 - 8 warps and J up to 128. On gfx906 the
-// dequant (grid LUT + signs) happens in the tile load, so wider tiles and more
-// warps amortize it the same way as for Q8_0. Each type keeps its rdna2 SRAM
-// layout; the sram size check in mul_mat_q_switch_J caps J where needed
-// (e.g. the wider Q3_K layout does not fit J=128).
+// IQ* and K-quant types: same treatment as Q8_0 - 8 warps and J up to 128. On
+// gfx906 the dequant (grid LUT + signs, or the K-quant scales/mins) happens in
+// the tile load, so wider tiles and more warps amortize it the same way as for
+// Q8_0. Each type keeps its rdna2 SRAM layout; the sram size check in
+// mul_mat_q_switch_J caps J where needed (e.g. the wider Q3_K / Q6_K layouts do
+// not fit J=128).
 //
 // MXFP4: 8 warps as well - rdna2's table with nthreads overridden, so tile
 // widths and layout stay in sync with upstream.
@@ -36,6 +37,21 @@ static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_conf
             case GGML_TYPE_IQ2_S:
                 return ggml_cuda_mmq_config(
                     type, 512, 2, 128, J, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, fallback);
+            // K-quants: same treatment, each keeps its rdna2 SRAM layout. Q6_K is the
+            // widest (6.5625 bpw) so the sram check in mul_mat_q_switch_J caps its J.
+            case GGML_TYPE_Q4_K:
+            case GGML_TYPE_Q5_K:
+                return ggml_cuda_mmq_config(
+                    type, 512, 2, 128, J, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, false, fallback);
+            case GGML_TYPE_Q2_K:
+                return ggml_cuda_mmq_config(
+                    type, 512, 2, 128, J, GGML_CUDA_MMQ_SRAM_LAYOUT_Q2_K, MMQ_ITER_K, false, fallback);
+            case GGML_TYPE_Q3_K:
+                return ggml_cuda_mmq_config(
+                    type, 512, 2, 128, J, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, fallback);
+            case GGML_TYPE_Q6_K:
+                return ggml_cuda_mmq_config(
+                    type, 512, 2, 128, J, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, false, fallback);
             default:
                 break;
         }
