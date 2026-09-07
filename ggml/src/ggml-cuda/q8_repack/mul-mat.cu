@@ -1,6 +1,9 @@
 // Dense (non-MoE) entry point for repacked Q8_0 weights: quantize src1, then dispatch
 // the mat-vec (single token) or tiled GEMM (multi-token) path per 2D slice.
 #include "repack.cuh"
+#include <cstdio>
+#include <vector>
+#include <set>
 #include "repack-common.cuh"
 #include "repack-kernels.cuh"
 #include "../quantize.cuh"
@@ -77,6 +80,10 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
                         ggml_cuda_mul_mat_repacked_nc_t<GGML_TYPE_MXFP4>(w, xq, dst_d,
                             ne00, ne01, ne11, (uint32_t) x_stride, dst_s1, stream);
                         break;
+                    case GGML_TYPE_Q4_0:
+                        ggml_cuda_mul_mat_repacked_nc_t<GGML_TYPE_Q4_0>(w, xq, dst_d,
+                            ne00, ne01, ne11, (uint32_t) x_stride, dst_s1, stream);
+                        break;
                     default: GGML_ABORT("unsupported repack type");
                 }
             }
@@ -131,10 +138,29 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
     const int64_t s12 = src1->nb[2] / sizeof(float);
     const int64_t s13 = src1->nb[3] / sizeof(float);
     const uint32_t dst_s1 = dst->nb[1] / sizeof(float);
+    // The GEMM reads the activation scale via block_q8_1_mmq::d4 (the D4
+    // layout). mmq_get_q8_1_ds_layout() returns DS4 for Q4_0, which the GEMM
+    // would misread, so quantize src1 with a D4-layout type (Q8_0) regardless
+    // of the actual weight type. Only the scale layout differs, not the q data.
+    const ggml_type ds_type = GGML_TYPE_Q8_0;
+    // DEBUG: dump the FLOAT activation (src1) for the first ffn_down (ne00=12288)
+    // to compare hidden states between repack/generic configs.
+    if (getenv("RP_DUMPS1") != nullptr && ne00 == 12288) {
+        static bool done = false;
+        if (!done) {
+            done = true;
+            const size_t n = (size_t) ne10 * ne11;
+            std::vector<float> s1(n);
+            cudaStreamSynchronize(stream);
+            cudaMemcpy(s1.data(), src1->data, n*4, cudaMemcpyDeviceToHost);
+            FILE * f = fopen("/tmp/s1_ffndown.bin", "wb"); fwrite(s1.data(), 1, n*4, f); fclose(f);
+            fprintf(stderr, "[RP_DUMPS1] ffn_down src1 n=%zu\n", n);
+        }
+    }
     for (int64_t col = 0; col < ne11; col += chunk_ne11) {
         const int64_t iter_ne11 = std::min(chunk_ne11, ne11 - col);
         quantize_mmq_q8_1_cuda((const float *) src1->data + col*s11, nullptr, src1_q8_1.get(),
-            src0->type, ne10, s11, s12, s13, ne10_padded, iter_ne11, ne12, ne13, stream);
+            ds_type, ne10, s11, s12, s13, ne10_padded, iter_ne11, ne12, ne13, stream);
 
         for (int64_t i3 = 0; i3 < ne13; i3++) {
         for (int64_t i2 = 0; i2 < ne12; i2++) {
@@ -284,6 +310,12 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
                     w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
                     nullptr, 1, 0, 0, 0);
             } break;
+            case GGML_TYPE_Q4_0: {
+                const dim3 grid((ne01 + 15) / 16, 1, 1);
+                mul_mat_vec_rp<GGML_TYPE_Q4_0, 16, 16, false><<<grid, 1024, 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
+                    nullptr, 1, 0, 0, 0);
+            } break;
             default: GGML_ABORT("unsupported repack type");
         }
         return;
@@ -292,6 +324,14 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
     // Multi-token: 64-wide GEMM for large batches, 32-wide for small ones.
     const int nrl  = MMQ_RP_Q8_NROW_LANES;
     const int mmq_bm = MMQ_RP_Q8_BM;
+    if (getenv("RP_TRACE") != nullptr && src0->type == GGML_TYPE_Q4_0) {
+        static int nlog = 0;
+        if (nlog++ < 40) {
+            fprintf(stderr, "[RP_TRACE] Q4_0 GEMM ne00=%ld ne01=%ld ne11=%ld path=%s\n",
+                (long) ne00, (long) ne01, (long) ne11,
+                ne11 >= 128 ? "gemm64" : (ne11 >= 9 ? "gemm32" : "narrow"));
+        }
+    }
     if (ne11 >= 128) {
         const int bn = 64 * MMQ_RP_Q8_TN;
         const dim3 grid((ne01 + mmq_bm - 1) / mmq_bm,
@@ -307,7 +347,38 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
                     w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11,
                     nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
                 break;
+            case GGML_TYPE_Q4_0:
+                mmq_gemm_repacked<false, MMQ_RP_Q8_TN, nrl, GGML_TYPE_Q4_0><<<grid, dim3(64, nrl), 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11,
+                    nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
+                break;
             default: GGML_ABORT("unsupported repack type");
+        }
+        // Dump w/xq/y for the first occurrence of each (ne00,ne01) shape, after the
+        // kernel runs, to verify every Q4_0 GEMM shape against a CPU reference.
+        if (getenv("RP_DUMPG") != nullptr && src0->type == GGML_TYPE_Q4_0) {
+            static std::set<std::string> dumped_shapes;
+            std::string key = std::to_string(ne00) + "x" + std::to_string(ne01);
+            if (dumped_shapes.count(key) == 0) {
+                dumped_shapes.insert(key);
+                cudaDeviceSynchronize();
+                const size_t w_nbytes = repack_gcn_nbytes(GGML_TYPE_Q4_0, ne00, ne01);
+                const size_t xq_nbytes = (size_t)(ne00 / 128) * ne11 * sizeof(block_q8_1_mmq_h);
+                std::vector<uint8_t> wbuf(w_nbytes), xbuf(xq_nbytes);
+                std::vector<float> ybuf((size_t) ne01 * ne11);
+                cudaMemcpy(wbuf.data(), w, w_nbytes, cudaMemcpyDeviceToHost);
+                cudaMemcpy(xbuf.data(), xq, xq_nbytes, cudaMemcpyDeviceToHost);
+                cudaMemcpy(ybuf.data(), dst_d, (size_t) ne01 * ne11 * 4, cudaMemcpyDeviceToHost);
+                auto wfile = [](const char * path, const void * p, size_t n) {
+                    FILE * f = fopen(path, "wb"); if (f) { fwrite(p, 1, n, f); fclose(f); }
+                };
+                char path[512];
+                snprintf(path, sizeof(path), "/tmp/g_w_%s.bin", key.c_str());   wfile(path, wbuf.data(), w_nbytes);
+                snprintf(path, sizeof(path), "/tmp/g_xq_%s.bin", key.c_str()); wfile(path, xbuf.data(), xq_nbytes);
+                snprintf(path, sizeof(path), "/tmp/g_y_%s.bin", key.c_str());   wfile(path, ybuf.data(), ybuf.size()*4);
+                fprintf(stderr, "[RP_DUMPG] shape %s w=%zu xq=%zu y=%zu\n",
+                    key.c_str(), w_nbytes, xq_nbytes, ybuf.size()*4);
+            }
         }
     } else {
         const int bn = 32;
@@ -321,6 +392,11 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
                 break;
             case GGML_TYPE_MXFP4:
                 mmq_gemm_repacked_w32<false, 1, nrl*2, GGML_TYPE_MXFP4><<<grid, dim3(32, nrl*2), 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11,
+                    nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
+                break;
+            case GGML_TYPE_Q4_0:
+                mmq_gemm_repacked_w32<false, 1, nrl*2, GGML_TYPE_Q4_0><<<grid, dim3(32, nrl*2), 0, stream>>>(
                     w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11,
                     nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
                 break;

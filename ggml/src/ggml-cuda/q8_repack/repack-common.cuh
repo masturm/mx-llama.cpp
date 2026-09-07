@@ -38,11 +38,12 @@ static __host__ __device__ inline T repack_qs_stride(const T ne0) {
 }
 
 // Per-type qs row stride and scale row bytes: Q8_0 rows carry ne0 payload
-// bytes and 2 B f16 scales per sub-block, MXFP4 rows carry packed nibbles
-// (ne0/2 B) and 1 B e8m0 scales per sub-block. Both share the de-alias bump.
+// bytes and 2 B f16 scales per sub-block; MXFP4 and Q4_0 rows carry packed
+// nibbles (ne0/2 B). MXFP4 scales are 1 B e8m0, Q8_0/Q4_0 are 2 B f16. All
+// share the de-alias bump.
 template <typename T>
 static __host__ __device__ inline T repack_qs_row_stride(const ggml_type type, const T ne0) {
-    return repack_qs_stride(type == GGML_TYPE_MXFP4 ? ne0 / 2 : ne0);
+    return repack_qs_stride((type == GGML_TYPE_MXFP4 || type == GGML_TYPE_Q4_0) ? ne0 / 2 : ne0);
 }
 template <typename T>
 static __host__ __device__ inline T repack_scale_row_bytes(const ggml_type type, const T ne0) {
@@ -61,13 +62,17 @@ static inline size_t repack_gcn_nbytes(const ggml_type type, const int64_t ne0, 
         // uint16_t; only the GLOBAL load narrows.
         case GGML_TYPE_MXFP4:
             return (size_t) ne1 * ((size_t) repack_qs_stride(ne0 / 2) + (size_t)(ne0 / 32));
+        // nibble plane [ne0/2 B] + 2 B f16 scale plane [ne0/32]/row, like Q8_0
+        // but the qs payload is half the width (4-bit, not 8-bit).
+        case GGML_TYPE_Q4_0:
+            return (size_t) ne1 * ((size_t) repack_qs_stride(ne0 / 2) + (size_t)(ne0 / 32) * 2);
         default:             GGML_ABORT("unsupported repack type");
     }
 }
 
 // Bytes per sub-block in the qs plane, and uint4 loads needed to fetch one.
 static __host__ __device__ inline int repack_qs_bytes(const ggml_type type) {
-    return type == GGML_TYPE_MXFP4 ? 16 : 32;
+    return (type == GGML_TYPE_MXFP4 || type == GGML_TYPE_Q4_0) ? 16 : 32;
 }
 
 #if defined(GGML_USE_HIP) && defined(__gfx906__)
@@ -84,6 +89,22 @@ static __device__ __forceinline__ void rp_mxfp4_expand(
     const int2 v1 = get_int_from_table_16((int) nib.y, kvalues_mxfp4);
     const int2 v2 = get_int_from_table_16((int) nib.z, kvalues_mxfp4);
     const int2 v3 = get_int_from_table_16((int) nib.w, kvalues_mxfp4);
+    lo = make_uint4((uint32_t) v0.x, (uint32_t) v1.x, (uint32_t) v2.x, (uint32_t) v3.x);
+    hi = make_uint4((uint32_t) v0.y, (uint32_t) v1.y, (uint32_t) v2.y, (uint32_t) v3.y);
+}
+
+// Q4_0 sub-block: 16 payload bytes coding 32 signed 4-bit values as nibbles.
+// The host repack re-orders the nibbles so slot j holds low = values 4j..4j+3,
+// high = values 16+4j..19+4j, the same arrangement the MXFP4 widen expects.
+// The table is the sign-extension of the raw nibble, so the widen is the same
+// perm-based LUT as MXFP4 with a different table.
+static const int8_t kvalues_q4_0[16] = { 0, 1, 2, 3, 4, 5, 6, 7, -8, -7, -6, -5, -4, -3, -2, -1 };
+static __device__ __forceinline__ void rp_q4_0_expand(
+        const uint4 nib, uint4 & lo, uint4 & hi) {
+    const int2 v0 = get_int_from_table_16((int) nib.x, kvalues_q4_0);
+    const int2 v1 = get_int_from_table_16((int) nib.y, kvalues_q4_0);
+    const int2 v2 = get_int_from_table_16((int) nib.z, kvalues_q4_0);
+    const int2 v3 = get_int_from_table_16((int) nib.w, kvalues_q4_0);
     lo = make_uint4((uint32_t) v0.x, (uint32_t) v1.x, (uint32_t) v2.x, (uint32_t) v3.x);
     hi = make_uint4((uint32_t) v0.y, (uint32_t) v1.y, (uint32_t) v2.y, (uint32_t) v3.y);
 }
@@ -275,16 +296,54 @@ template <> struct rp_traits<GGML_TYPE_MXFP4> {
         raw = rp_ldcs_u4(qsp + (size_t) wrow * g.rs_u4 + sb);
         d   = wbase[g.dplane_off + (size_t) wrow * g.n_sub + sb];
     }
+    static __device__ __forceinline__ void expand(const uint4 nib, uint4 & lo, uint4 & hi) {
+        rp_mxfp4_expand(nib, lo, hi);
+    }
     static __device__ __forceinline__ float scale(const uint16_t s) {
         return ggml_cuda_e8m0_to_fp32((uint8_t) s) * 0.5f;
     }
 #endif
 };
 
+template <> struct rp_traits<GGML_TYPE_Q4_0> {
+    // de-aliased nibble rows [ne1 x rs], then a 2-byte f16 scale plane [ne1 x n_sub].
+    struct geom {
+        uint32_t rs, rs_u4, n_sub;
+        size_t   dplane_off;
+        __host__ __device__ geom(uint32_t ne0, uint32_t ne1)
+            : rs(repack_qs_row_stride(GGML_TYPE_Q4_0, ne0)), rs_u4(rs >> 4),
+              n_sub(ne0 >> 5), dplane_off((size_t) ne1 * rs) {}
+    };
+    // Same RAW-nibble staging as MXFP4: the GEMM prefetches one uint4 of packed
+    // 4-bit values and widens to int8 once at the LDS store.
+    static constexpr bool raw_lds = true;
+#if defined(GGML_USE_HIP) && defined(__gfx906__)
+    static __device__ __forceinline__ void load_w(const uint8_t * __restrict__ wbase,
+            const geom & g, uint32_t wrow, uint32_t sb, uint4 & lo, uint4 & hi, uint16_t & d) {
+        const uint4 * qsp = reinterpret_cast<const uint4 *>(wbase);
+        rp_q4_0_expand(rp_ldcs_u4(qsp + (size_t) wrow * g.rs_u4 + sb), lo, hi);
+        d = reinterpret_cast<const uint16_t *>(wbase + g.dplane_off)[(size_t) wrow * g.n_sub + sb];
+    }
+    static __device__ __forceinline__ void load_w_raw(const uint8_t * __restrict__ wbase,
+            const geom & g, uint32_t wrow, uint32_t sb, uint4 & raw, uint16_t & d) {
+        const uint4 * qsp = reinterpret_cast<const uint4 *>(wbase);
+        raw = rp_ldcs_u4(qsp + (size_t) wrow * g.rs_u4 + sb);
+        d   = reinterpret_cast<const uint16_t *>(wbase + g.dplane_off)[(size_t) wrow * g.n_sub + sb];
+    }
+    static __device__ __forceinline__ void expand(const uint4 nib, uint4 & lo, uint4 & hi) {
+        rp_q4_0_expand(nib, lo, hi);
+    }
+    static __device__ __forceinline__ float scale(const uint16_t s) {
+        return __half2float(*reinterpret_cast<const __half *>(&s));
+    }
+#endif
+};
+
 // One entry per supported repack type - generates the dispatch switches.
-#define RP_FOREACH_TYPE(X)     X(GGML_TYPE_Q8_0)          X(GGML_TYPE_MXFP4)
+#define RP_FOREACH_TYPE(X)     X(GGML_TYPE_Q8_0)          X(GGML_TYPE_MXFP4)     X(GGML_TYPE_Q4_0)
 void repack_q8_0_host(const block_q8_0 * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1);
 void repack_mxfp4_host(const block_mxfp4 * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1);
+void repack_q4_0_host(const block_q4_0 * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1);
 void repack_host(ggml_type type, const void * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1);
 
 const uint8_t * repack_view_get_cached(

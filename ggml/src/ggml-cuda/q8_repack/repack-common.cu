@@ -15,7 +15,14 @@ bool ggml_cuda_repack_tensor_supported(const ggml_tensor * t) {
     }
     switch (t->type) {
         case GGML_TYPE_Q8_0:
-        case GGML_TYPE_MXFP4: {
+        case GGML_TYPE_MXFP4:
+        case GGML_TYPE_Q4_0: {
+            if (getenv("RP_NO_Q40") != nullptr && t->type == GGML_TYPE_Q4_0) {
+                return false;   // EXPERIMENT: force Q4_0 to the generic path
+            }
+            if (getenv("RP_NO_Q80") != nullptr && t->type == GGML_TYPE_Q8_0) {
+                return false;   // EXPERIMENT: force Q8_0 to the generic path
+            }
             return t->ne[0] % 32 == 0;
         }
         default:             return false;
@@ -101,6 +108,34 @@ void repack_mxfp4_host(const block_mxfp4 * blocks, uint8_t * dst, const int64_t 
     }
 }
 
+// Host repack of one Q4_0 matrix: nibble rows [ne1 x qs_str, de-aliased] with the
+// nibbles re-ordered so byte j holds value j (low) and value 16+j (high). That
+// makes the shared rp_q4_0_expand yield lo = values 0..15 and hi = 16..31, the
+// split the GEMM dp4a expects. Canonical byte b holds values 2b (low) and 2b+1
+// (high). Then a 2-byte f16 scale plane [ne1 x ne0/32].
+void repack_q4_0_host(const block_q4_0 * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1) {
+    GGML_ASSERT(ne0 % 32 == 0);
+    const int64_t n_blocks = ne0 / 32;
+    const int64_t qs_str   = repack_qs_row_stride(GGML_TYPE_Q4_0, ne0);
+    const size_t  qs_len   = (size_t) ne1 * qs_str;
+
+    memset(dst, 0, qs_len + (size_t) ne1 * n_blocks * 2);
+
+    for (int64_t row = 0; row < ne1; row++) {
+        for (int64_t blk = 0; blk < n_blocks; blk++) {
+            const block_q4_0 * b  = &blocks[row * n_blocks + blk];
+            uint8_t *          d_qs = dst + (size_t) row * qs_str + (size_t) blk * 16;
+            // Byte j already holds val[j] (low) + val[j+16] (high), which is the
+            // GEMM pairing (lo[j]=val[j], hi[j]=val[j+16]), so copy verbatim.
+#pragma unroll
+            for (int j = 0; j < 16; j++) {
+                d_qs[j] = b->qs[j];
+            }
+            memcpy(dst + qs_len + (size_t) (row * n_blocks + blk) * 2, &b->d, 2);
+        }
+    }
+}
+
 void repack_host(ggml_type type, const void * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1) {
     switch (type) {
         case GGML_TYPE_Q8_0:
@@ -108,6 +143,9 @@ void repack_host(ggml_type type, const void * blocks, uint8_t * dst, const int64
             break;
         case GGML_TYPE_MXFP4:
             repack_mxfp4_host((const block_mxfp4 *) blocks, dst, ne0, ne1);
+            break;
+        case GGML_TYPE_Q4_0:
+            repack_q4_0_host((const block_q4_0 *) blocks, dst, ne0, ne1);
             break;
         default:
             GGML_ABORT("unsupported repack type");

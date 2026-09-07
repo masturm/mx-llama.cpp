@@ -8,6 +8,7 @@
 #include "ggml-backend-impl.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -96,6 +97,26 @@ static void repack_and_upload(ggml_backend_buffer_t buffer, ggml_tensor * tensor
         cudaMemcpyHostToDevice, s_upl_stream[dev]));
     CUDA_CHECK(cudaEventRecord(u.ev, s_upl_stream[dev]));
     u.ev_live = true;
+
+    // DEBUG (q40): dump one tensor per shape, host-repacked vs device, for diffing
+    if (getenv("RP_DUMP") != nullptr && tensor->type == GGML_TYPE_Q4_0) {
+        static std::map<std::string, bool> dumped;
+        const std::string key = std::to_string(ne0) + "x" + std::to_string(ne1);
+        if (dumped.count(key) == 0) {
+            dumped[key] = true;
+            CUDA_CHECK(cudaEventSynchronize(u.ev));
+            std::vector<uint8_t> devbuf(need);
+            CUDA_CHECK(cudaMemcpy(devbuf.data(), tensor->data, need, cudaMemcpyDeviceToHost));
+            auto wfile = [](const std::string & path, const uint8_t * p, size_t n) {
+                FILE * f = fopen(path.c_str(), "wb");
+                fwrite(p, 1, n, f);
+                fclose(f);
+            };
+            wfile("/tmp/rp_host_" + key + ".bin", repacked, need);
+            wfile("/tmp/rp_dev_" + key + ".bin", devbuf.data(), need);
+            GGML_LOG_INFO("RP_DUMP: %s shape %s (%zu bytes)\n", tensor->name, key.c_str(), need);
+        }
+    }
 }
 
 // ---- async upload path ------------------------------------------------------
@@ -159,6 +180,36 @@ static __global__ void repack_mxfp4_kernel(
     }
 }
 
+// Device-side Q4_0 repack: canonical block_q4_0 (18 B: f16 d, 16 nibble bytes)
+// to de-aliased nibble rows (re-ordered like repack_q4_0_host) + a 2-byte f16
+// scale plane. The re-order makes the shared widen yield the lo/hi split the
+// GEMM dp4a expects.
+static __global__ void repack_q4_0_kernel(
+        const uint8_t * __restrict__ src, uint8_t * __restrict__ dst,
+        const int64_t ne1, const int64_t n_blocks, const int64_t qs_str,
+        const int64_t qs_len, const int64_t src_stride, const int64_t dst_stride,
+        const int64_t total) {
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+         i < total; i += (int64_t) gridDim.x * blockDim.x) {
+        const int64_t blk = i % n_blocks;
+        const int64_t row = (i / n_blocks) % ne1;
+        const int64_t e   = i / (n_blocks * ne1);
+
+        uint8_t * d_qs = dst + e * dst_stride + row * qs_str + blk * 16;
+        uint8_t * d_d  = dst + e * dst_stride + qs_len + (row * n_blocks + blk) * 2;
+
+        const uint8_t * sb = src + e * src_stride + (row * n_blocks + blk) * 18;
+        // Byte j already holds val[j] (low) + val[j+16] (high), which is the
+        // GEMM pairing (lo[j]=val[j], hi[j]=val[j+16]), so copy verbatim.
+#pragma unroll
+        for (int j = 0; j < 16; j++) {
+            d_qs[j] = sb[2 + j];
+        }
+        d_d[0] = sb[0];
+        d_d[1] = sb[1];
+    }
+}
+
 struct repack_async_state {
     uint8_t *           scratch  = nullptr;
     size_t              cap      = 0;
@@ -216,6 +267,11 @@ void ggml_cuda_repack_set_tensor_async(int device, cudaStream_t stream,
                     st.scratch, (uint8_t *) tensor->data, ne1, n_blocks, qs_str,
                     ne1 * qs_str, (int64_t) src_str, (int64_t) dst_str, n_out);
                 break;
+            case GGML_TYPE_Q4_0:
+                repack_q4_0_kernel<<<grid, block, 0, stream>>>(
+                    st.scratch, (uint8_t *) tensor->data, ne1, n_blocks, qs_str,
+                    ne1 * qs_str, (int64_t) src_str, (int64_t) dst_str, n_out);
+                break;
             default:
                 GGML_ABORT("unsupported repack type for async upload");
         }
@@ -269,7 +325,23 @@ static void ggml_backend_cuda_repack_buffer_set_tensor(
         return;
     }
 
+    GGML_LOG_DEBUG("repack set_tensor: %s ne=[%ld %ld %ld] off=%zu size=%zu\n",
+        tensor->name, (long) tensor->ne[0], (long) tensor->ne[1], (long) tensor->ne[2], offset, size);
+
     const size_t t_nbytes = ggml_nbytes(tensor);
+
+    // DEBUG: dump the embedding device buffer to check if it was repacked.
+    if (getenv("RP_DUMP_EMBD") != nullptr && strcmp(tensor->name, "token_embd.weight") == 0
+        && offset == 0 && size == t_nbytes) {
+        std::vector<uint8_t> db(t_nbytes);
+        cudaStreamSynchronize(cudaStreamPerThread);
+        cudaMemcpy(db.data(), tensor->data, t_nbytes, cudaMemcpyDeviceToHost);
+        FILE * f = fopen("/tmp/embd_dev.bin", "wb"); fwrite(db.data(), 1, t_nbytes, f); fclose(f);
+        fprintf(stderr, "[RP_DUMP_EMBD] token_embd repacked=%d supported=%d nbytes=%zu ne0=%ld ne1=%ld\n",
+            (int) (ggml_backend_buft_is_cuda_repack(buffer->buft) && ggml_cuda_repack_tensor_supported(tensor)),
+            (int) ggml_cuda_repack_tensor_supported(tensor), t_nbytes,
+            (long) tensor->ne[0], (long) tensor->ne[1]);
+    }
 
     if (offset != 0 || size != t_nbytes) {
         // Partial write (the meta splitter under -sm tensor): accumulate into a

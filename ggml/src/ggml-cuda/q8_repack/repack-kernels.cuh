@@ -689,7 +689,7 @@ static __device__ void mmq_gemm_repacked_impl(
             const int lk = e % MMQ_RP_Q8_BK;
             if constexpr (RAW_REG) {
                 uint4 lo, hi;
-                rp_mxfp4_expand(pw_lo[i], lo, hi);
+                rp_traits<WT>::expand(pw_lo[i], lo, hi);
                 sW_lo[lr][lk] = lo;
                 sW_hi[lr][lk] = hi;
             } else {
