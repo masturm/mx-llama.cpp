@@ -138,9 +138,8 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
     const int64_t s12 = src1->nb[2] / sizeof(float);
     const int64_t s13 = src1->nb[3] / sizeof(float);
     const uint32_t dst_s1 = dst->nb[1] / sizeof(float);
-    // The GEMM reads the activation scale via block_q8_1_mmq::d4 (the D4
-    // layout). mmq_get_q8_1_ds_layout() returns DS4 for Q4_0, which the GEMM
-    // would misread, so quantize src1 with a D4-layout type (Q8_0) regardless
+    // The GEMM reads the activation scale via rp_x_sub_from_mmq_group, which decodes
+    // the D4 layout (float scale). Quantize src1 with a D4-layout type (Q8_0) regardless
     // of the actual weight type. Only the scale layout differs, not the q data.
     const ggml_type ds_type = GGML_TYPE_Q8_0;
     // DEBUG: dump the FLOAT activation (src1) for the first ffn_down (ne00=12288)
@@ -154,7 +153,10 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
             cudaStreamSynchronize(stream);
             cudaMemcpy(s1.data(), src1->data, n*4, cudaMemcpyDeviceToHost);
             FILE * f = fopen("/tmp/s1_ffndown.bin", "wb"); fwrite(s1.data(), 1, n*4, f); fclose(f);
-            fprintf(stderr, "[RP_DUMPS1] ffn_down src1 n=%zu\n", n);
+            fprintf(stderr, "[RP_DUMPS1] ffn_down ne10=%ld ne11=%ld s11=%ld s12=%ld s13=%ld "
+                "chunk_ne11=%ld nb[0]=%zu nb[1]=%zu nb[2]=%zu nb[3]=%zu\n",
+                (long) ne10, (long) ne11, (long) s11, (long) s12, (long) s13,
+                (long) chunk_ne11, src1->nb[0], src1->nb[1], src1->nb[2], src1->nb[3]);
         }
     }
     for (int64_t col = 0; col < ne11; col += chunk_ne11) {
@@ -330,6 +332,27 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
             fprintf(stderr, "[RP_TRACE] Q4_0 GEMM ne00=%ld ne01=%ld ne11=%ld path=%s\n",
                 (long) ne00, (long) ne01, (long) ne11,
                 ne11 >= 128 ? "gemm64" : (ne11 >= 9 ? "gemm32" : "narrow"));
+        }
+    }
+    // DEBUG: dump the W and xq for the first Q4_0 GEMM to verify the GEMM reads
+    // the correct inputs.
+    if (getenv("RP_DUMPWX") != nullptr && src0->type == GGML_TYPE_Q4_0 && ne11 >= 128) {
+        static bool done = false;
+        if (!done) {
+            done = true;
+            cudaStreamSynchronize(stream);
+            const size_t wsize = repack_gcn_nbytes(src0->type, ne00, ne01);
+            std::vector<uint8_t> wb(wsize);
+            cudaMemcpy(wb.data(), w, wsize, cudaMemcpyDeviceToHost);
+            FILE * f = fopen("/tmp/rp_w.bin", "wb"); if (f) { fwrite(wb.data(), 1, wsize, f); fclose(f); }
+            const size_t xqsize = (size_t) ne00 * ne11 * (repack_qs_bytes(src0->type) / 8 + 4);
+            // xq is in the block_q8_1_mmq_h layout: [ne0/128, ne11, 144]
+            const size_t xqsz = (size_t)(ne00/128) * ne11 * 144;
+            std::vector<uint8_t> xb(xqsz);
+            cudaMemcpy(xb.data(), xq, xqsz, cudaMemcpyDeviceToHost);
+            FILE * xf = fopen("/tmp/rp_xq.bin", "wb"); if (xf) { fwrite(xb.data(), 1, xqsz, xf); fclose(xf); }
+            fprintf(stderr, "[RP_DUMPWX] Q4_0 ne00=%ld ne01=%ld ne11=%ld wsize=%zu xqsz=%zu\n",
+                (long) ne00, (long) ne01, (long) ne11, wsize, xqsz);
         }
     }
     if (ne11 >= 128) {

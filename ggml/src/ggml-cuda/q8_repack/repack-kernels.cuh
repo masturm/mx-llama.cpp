@@ -537,8 +537,8 @@ static __device__ void mmq_gemm_repacked_impl(
     // LDS stays expanded: expanding at consume instead multiplied the expand
     // by the row*column reuse and measured -40% prefill.
     constexpr bool RAW_REG = rp_traits<WT>::raw_lds;
-    __shared__ uint4    sW_lo[MMQ_RP_Q8_BM][MMQ_RP_Q8_BK];
-    __shared__ uint4    sW_hi[MMQ_RP_Q8_BM][MMQ_RP_Q8_BK];
+    __shared__ uint4    sW_lo[MMQ_RP_Q8_BM][8];
+    __shared__ uint4    sW_hi[MMQ_RP_Q8_BM][8];
     __shared__ uint16_t sWdh[MMQ_RP_Q8_BK][MMQ_RP_Q8_BM];
     __shared__ sXq_row_q8 sXq[BN];
     __shared__ float    sXd[BN][MMQ_RP_Q8_BK + 1];

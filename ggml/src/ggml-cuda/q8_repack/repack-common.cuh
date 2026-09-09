@@ -8,7 +8,7 @@
 
 #include <cstddef>
 
-#define MMQ_RP_Q8_BK 4
+#define MMQ_RP_Q8_BK 8
 #define MMQ_RP_Q8_TN 2
 #define MMQ_RP_Q8_BM 64
 #define MMQ_RP_Q8_NROW_LANES 4

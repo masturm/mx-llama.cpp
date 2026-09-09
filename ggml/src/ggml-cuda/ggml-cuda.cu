@@ -92,6 +92,8 @@
 #include <cstdlib>
 #include <string>
 #include <vector>
+#include <set>
+#include <cstring>
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 
@@ -2529,8 +2531,70 @@ char * ggml_cuda_q8_1_cache_acquire(
     return buf;
 }
 
+// DEBUG: dumps the GEMM dst in its destructor (i.e. at ggml_cuda_mul_mat exit, after
+// the GEMM has been enqueued). Used to compare GEMM outputs between configs.
+struct rp_dst_dumper {
+    ggml_tensor * dst; cudaStream_t stream; bool active; const char * name;
+    rp_dst_dumper(ggml_tensor * d, cudaStream_t s, bool a, const char * nm) : dst(d), stream(s), active(a), name(nm) {}
+    ~rp_dst_dumper() {
+        if (!active) return;
+        static std::set<std::string> dumped;
+        if (dumped.count(name)) return;
+        dumped.insert(name);
+        cudaStreamSynchronize(stream);
+        const size_t n = (size_t) dst->ne[0] * dst->ne[1];
+        std::vector<float> d(n);
+        cudaMemcpy(d.data(), dst->data, n*4, cudaMemcpyDeviceToHost);
+        std::string safe = name; for (auto & c : safe) if (c == '.' || c == '/') c = '_';
+        char path[256]; snprintf(path, sizeof(path), "/tmp/dst_%s_%s.bin", safe.c_str(),
+            getenv("RP_CFG") ? getenv("RP_CFG") : "x");
+        FILE * f = fopen(path, "wb"); if (f) { fwrite(d.data(), 1, n*4, f); fclose(f); }
+        fprintf(stderr, "[RP_DUMP_DST] %s ne0=%ld ne1=%ld nb1=%ld\n", name, (long) dst->ne[0], (long) dst->ne[1], (long) dst->nb[1]);
+    }
+};
+
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_TENSOR_BINARY_OP_LOCALS
+
+    // DEBUG: dump the float src1 (at entry) and dst (at exit) for every Q4_0 GEMM in
+    // blk.0 (ne11==512), keyed by tensor name, to find the first divergence.
+    const bool rp_dbg = getenv("RP_DUMPSRC") != nullptr && src0->type == GGML_TYPE_Q4_0 && ne11 == 512
+            && strncmp(src0->name, "blk.0.", 6) == 0 && src1->type == GGML_TYPE_F32;
+    rp_dst_dumper dst_dumper(dst, ctx.stream(), rp_dbg, src0->name);
+    if (rp_dbg) {
+        static std::set<std::string> done_names;
+        if (done_names.count(src0->name) == 0) {
+            done_names.insert(src0->name);
+            const bool rep = ggml_cuda_repack_mul_mat_should_fire(src0);
+            const size_t n = (size_t) ne00 * ne11;
+            std::vector<float> s1(n);
+            cudaStreamSynchronize(ctx.stream());
+            cudaMemcpy(s1.data(), src1->data, n*4, cudaMemcpyDeviceToHost);
+            std::string safe = src0->name;
+            for (auto & c : safe) if (c == '.' || c == '/') c = '_';
+            char path[256]; snprintf(path, sizeof(path), "/tmp/s1src_%s_%s.bin", safe.c_str(),
+                getenv("RP_CFG") ? getenv("RP_CFG") : "x");
+            FILE * f = fopen(path, "wb"); fwrite(s1.data(), 1, n*4, f); fclose(f);
+            // also dump the weight (src0) so the two-plane vs canonical W can be compared.
+            // In repack mode the buffer is LARGER than ggml_nbytes (two-plane layout),
+            // so use the actual allocated size.
+            cudaStreamSynchronize(ctx.stream());
+            size_t wn = ggml_nbytes(src0);
+            if (rep) {
+                const size_t asn = ggml_backend_buffer_get_alloc_size(src0->buffer, src0);
+                if (asn > wn) wn = asn;
+            }
+            std::vector<uint8_t> wb(wn);
+            cudaMemcpy(wb.data(), src0->data, wn, cudaMemcpyDeviceToHost);
+            char wpath[256]; snprintf(wpath, sizeof(wpath), "/tmp/wsrc_%s_%s.bin", safe.c_str(),
+                getenv("RP_CFG") ? getenv("RP_CFG") : "x");
+            FILE * wf = fopen(wpath, "wb"); fwrite(wb.data(), 1, wn, wf); fclose(wf);
+            fprintf(stderr, "[RP_DUMPSRC] %s buf_repack=%d name=%s ne00=%ld ne11=%ld s11=%ld s12=%ld wbytes=%zu\n",
+                rep ? "repack" : "generic",
+                (src0->buffer && ggml_backend_buft_is_cuda_repack(ggml_backend_buffer_get_type(src0->buffer))) ? 1 : 0,
+                src0->name, (long) ne00, (long) ne11, (long) (src1->nb[1]/sizeof(float)), (long) (src1->nb[2]/sizeof(float)), wn);
+        }
+    }
 
     const int32_t hint = ggml_get_op_params_i32(dst, 1);
     if (hint == GGML_HINT_SRC0_IS_HADAMARD && ggml_cuda_op_fwht(ctx, src1, dst)) {
@@ -3098,9 +3162,38 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_GATED_LINEAR_ATTN:
             ggml_cuda_op_gated_linear_attn(ctx, dst);
             break;
-        case GGML_OP_GATED_DELTA_NET:
+        case GGML_OP_GATED_DELTA_NET: {
+            // DEBUG: trace that the GDN op is reached.
+            if (getenv("RP_TRACE_GDN") != nullptr) {
+                static int n_t = 0;
+                if (n_t++ < 10) fprintf(stderr, "[RP_TRACE_GDN] reached dst=%s\n", dst->name);
+            }
+            // DEBUG: dump the GDN op's input (src[0]) and output (dst) for the first
+            // occurrence in blk.0, keyed by config, to find where the hidden state diverges.
+            if (getenv("RP_DUMP_GDN") != nullptr) {
+                static int n_gdn = 0;
+                if (n_gdn < 2) {
+                    const int idx = n_gdn++;
+                    auto dumper = [&](const ggml_tensor * t, const char * tag) {
+                        if (t->type != GGML_TYPE_F32) return;
+                        const size_t n = ggml_nelements(t);
+                        std::vector<float> v(n);
+                        cudaStreamSynchronize(ctx.stream());
+                        cudaMemcpy(v.data(), t->data, n*4, cudaMemcpyDeviceToHost);
+                        char path[256]; snprintf(path, sizeof(path), "/tmp/gdn_%s_%d_%s.bin",
+                            tag, idx, getenv("RP_CFG") ? getenv("RP_CFG") : "x");
+                        FILE * f = fopen(path, "wb"); if (f) { fwrite(v.data(), 1, n*4, f); fclose(f); }
+                        fprintf(stderr, "[RP_DUMP_GDN] #%d %s %s ne=[%ld %ld %ld] n=%zu\n",
+                            idx, tag, t->name, (long) t->ne[0], (long) t->ne[1], (long) t->ne[2], n);
+                    };
+                    dumper(dst, "dst");
+                    dumper(dst->src[0], "src0");
+                    if (dst->src[1]) dumper(dst->src[1], "src1");
+                }
+            }
             ggml_cuda_op_gated_delta_net(ctx, dst);
             break;
+        }
         case GGML_OP_DSV4_HC_COMB:
             ggml_cuda_op_dsv4_hc_comb(ctx, dst);
             break;
@@ -4419,6 +4512,32 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
     if (node->op == GGML_OP_GATED_DELTA_NET) {
+        // DEBUG: trace + dump the fused GDN path (this is where the SSM recurrence actually runs).
+        if (getenv("RP_TRACE_GDN") != nullptr) {
+            static int n_t = 0;
+            if (n_t++ < 10) fprintf(stderr, "[RP_TRACE_GDN] FUSED path dst=%s\n", node->name);
+        }
+        if (getenv("RP_DUMP_GDN") != nullptr) {
+            static int n_gdn = 0;
+            if (n_gdn < 2) {
+                const int idx = n_gdn++;
+                cudaStreamSynchronize(cuda_ctx->stream());
+                auto dumper = [&](const ggml_tensor * t, const char * tag) {
+                    if (t->type != GGML_TYPE_F32) return;
+                    const size_t n = ggml_nelements(t);
+                    std::vector<float> v(n);
+                    cudaMemcpy(v.data(), t->data, n*4, cudaMemcpyDeviceToHost);
+                    char path[256]; snprintf(path, sizeof(path), "/tmp/gdn_%s_%d_%s.bin",
+                        tag, idx, getenv("RP_CFG") ? getenv("RP_CFG") : "x");
+                    FILE * f = fopen(path, "wb"); if (f) { fwrite(v.data(), 1, n*4, f); fclose(f); }
+                    fprintf(stderr, "[RP_DUMP_GDN] #%d %s %s ne=[%ld %ld %ld] n=%zu\n",
+                        idx, tag, t->name, (long) t->ne[0], (long) t->ne[1], (long) t->ne[2], n);
+                };
+                dumper(node, "dst");
+                dumper(node->src[0], "src0");
+                if (node->src[1]) dumper(node->src[1], "src1");
+            }
+        }
         ggml_cuda_gated_delta_net_fused_cache fused_state_cpy;
         const int nodes_to_skip = ggml_cuda_try_gdn_cache_fusion(cgraph, i, fused_state_cpy);
         if (nodes_to_skip > 0) {

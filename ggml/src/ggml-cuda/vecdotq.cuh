@@ -115,6 +115,8 @@ static __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
 #define VDR_Q4_0_Q8_1_MMVQ 2
 #define VDR_Q4_0_Q8_1_MMQ  4
 
+static const __device__ int8_t kvalues_id16[16] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+
 template <int vdr> static __device__ __forceinline__ float vec_dot_q4_0_q8_1_impl(
     const int * v, const int * u, const float & d4, const half2 & ds8) {
 
@@ -122,12 +124,11 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q4_0_q8_1_imp
 
 #pragma unroll
     for (int i = 0; i < vdr; ++i) {
-        const int vi0 = (v[i] >> 0) & 0x0F0F0F0F;
-        const int vi1 = (v[i] >> 4) & 0x0F0F0F0F;
+        const int2 vi = get_int_from_table_16(v[i], kvalues_id16);
 
         // SIMD dot product of quantized values
-        sumi = ggml_cuda_dp4a(vi0, u[2*i+0], sumi);
-        sumi = ggml_cuda_dp4a(vi1, u[2*i+1], sumi);
+        sumi = ggml_cuda_dp4a(vi.x, u[2*i+0], sumi);
+        sumi = ggml_cuda_dp4a(vi.y, u[2*i+1], sumi);
     }
 
     const float2 ds8f = __half22float2(ds8);
@@ -135,6 +136,7 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q4_0_q8_1_imp
     // second part effectively subtracts 8 from each quant value
     return d4 * (sumi * ds8f.x - (8*vdr/QI4_0) * ds8f.y);
 }
+
 
 #define VDR_Q4_1_Q8_1_MMVQ 2
 #define VDR_Q4_1_Q8_1_MMQ  4
@@ -146,12 +148,11 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q4_1_q8_1_imp
 
 #pragma unroll
     for (int i = 0; i < vdr; ++i) {
-        const int vi0 = (v[i] >> 0) & 0x0F0F0F0F;
-        const int vi1 = (v[i] >> 4) & 0x0F0F0F0F;
+        const int2 vi = get_int_from_table_16(v[i], kvalues_id16);
 
         // SIMD dot product of quantized values
-        sumi = ggml_cuda_dp4a(vi0, u[2*i+0], sumi);
-        sumi = ggml_cuda_dp4a(vi1, u[2*i+1], sumi);
+        sumi = ggml_cuda_dp4a(vi.x, u[2*i+0], sumi);
+        sumi = ggml_cuda_dp4a(vi.y, u[2*i+1], sumi);
     }
 
 #ifdef FAST_FP16_AVAILABLE
