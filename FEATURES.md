@@ -2,7 +2,7 @@
 
 This fork extends upstream llama.cpp with multi-GPU and speculative-decoding
 optimizations. Most additions are backend-generic; the hardware-specific parts
-are the gfx906 (VEGA20) kernel tuning and the Q8_0/MXFP4 weight repack, both
+are the gfx906 (VEGA20) kernel tuning and the weight repack, both
 MI50 / MI60 / Radeon VII class GPUs.
 
 ## Building from source
@@ -89,6 +89,24 @@ KV staging, a KV-only prefill replay, disabling the draft context's pipeline rin
 and a non-finite-draft fail-safe. Default off uses the standard `draft-mtp` path
 with these disabled. Backend-generic.
 
+## Recurrent state rollback (snapshot ring)
+
+Recurrent and hybrid models checkpointed their state by whole planes, so a rejected
+speculative draft had no cheap way back and the state was rebuilt rather than rewound.
+That is what made MTP drafting on a delta-net model cost more than it saved. Each
+sequence now keeps its snapshots in a ring of physical planes with a head and a valid
+depth, the delta-net kernels scatter per-token snapshot rows as they run, and a graph
+that fails invalidates the affected sequences instead of leaving a half-written plane
+visible. Measured on 4x MI50 with Qwen3.8-Flash-Next MTP UD-Q4_K_XL, 554-token prompt
+at draft depth 2: speculative generation 29.8 to 42.4 t/s on `-sm layer` and 16.4 to
+42.5 t/s on `-sm tensor`, where before the change speculating was slower than not
+speculating at all. Plain generation goes 30.3 to 31.4 t/s with byte-identical output,
+and Qwen3.6-35B-A3B-Q4_K_M single-GPU prefill is unchanged, 955 to 953 (guardrail). No
+flag: rollback engages when a caller asks for it with a single sequence, and it is
+clamped off above one sequence and below a minimum micro-batch with a warning. It lives
+in the recurrent memory layer, so every delta-net model shares it. Backend-generic, the
+delta-net kernels are validated on gfx906.
+
 ## Concurrent lane dispatch
 
 Under `-sm tensor` the meta backend issued each subgraph to its GPUs in device
@@ -152,12 +170,22 @@ the loader maps lazily-read tensors even under `-lm dio`: the mapping is virtual
 prefetch is zero and the range is never populated, which avoids whole-model mmap's
 page thrashing while still letting the table be demand paged.
 
+The table can instead be warmed at load: `LLAMA_PLE_PREFAULT=1` touches one byte per
+page of it from eight threads once the weights are in, so the first request does not
+fault the rows in one at a time. That moves the read out of the first request and into
+load time, so how much it is worth is bounded by storage throughput, and it buys
+nothing once the table is already in page cache - it pays on a fresh process, not on a
+warm one. The log line reports the size touched and how long it took, so the cost is
+visible per machine. Off by default, inert when the table is not host resident, and it
+uses no VRAM.
+
 A NextN/MTP draft head is supported with `--spec-type draft-mtp`, converted by
 `convert_hf_to_gguf.py --mtp`. Draft acceptance runs 75-90 percent at `n_max 2` and
-is strongly text dependent (46 to 90 percent across prompts). Whether it is a net
-throughput win depends on the split mode - under `-sm tensor` the multi-GPU verify
-costs more than the drafting saves, while `-sm layer` lands near parity - so measure
-on your own topology before enabling it.
+is strongly text dependent (46 to 90 percent across prompts). With the recurrent
+snapshot ring above it is a throughput win in both split modes on this quant - see
+that section for the numbers - where previously the multi-GPU verify under `-sm tensor`
+cost more than the drafting saved. Acceptance still tracks the text, so measure on your
+own prompts.
 
 ## Shared-expert tensor-parallel split
 
@@ -248,36 +276,63 @@ The quantized copy is now kept and handed to the later matmuls, which is
 bit-exact. Worth +2.2-2.6% on prefill and decode. On by default;
 `GGML_CUDA_Q8_1_CACHE=0` restores the old behavior. Backend-generic.
 
-## Q8_0 and MXFP4 weight repack (gfx906)
+## Q8_0, MXFP4, K-quant and Q5_1 weight repack (gfx906)
 
-Q8_0 weights upload into a two-plane layout (quants and scales in separate
-planes) with tiled MMQ and mat-vec kernels reading it directly, contributed
-by DENEB1312. On by default on gfx906, carried by the extra buffer types
-like upstream's CPU weight repack, so `--no-repack` disables it; a draft
-model always loads canonical weights. Measured on 2x MI50: prefill +12 to
-+41% across dense and MoE models and both split modes, generation within a
-couple percent of the canonical path. Prefill is bit-exact and perplexity
-unchanged; greedy generation can differ within floating-point
-reassociation. Model load stages canonical bytes and repacks on the
-device, so `-sm layer` loads at vanilla-loader parity and tensor-parallel
-loads within about 1.4x of it. Narrow batches, such as the multi-token
-steps a speculative verify produces, fuse the MoE up and gate lanes and
-size their mat-vec lane group from the tensor shape and the device: a lane
-needs enough accumulation steps to cover its reduction, and the grid that
-results still has to fill the compute units. That puts them at or ahead of
-the canonical path per decode step, worth about 6% on multi-token
-prediction with a 35B MoE. Perplexity is unchanged on MoE and moves within
-floating-point reassociation on dense (6.7010 to 6.6858 on a 27B dense
-model at two tokens), while wide batches stay exact. Validated on gfx906.
+Weights of the types below upload into a repacked layout (quants and scales
+in separate planes, rows de-aliased) that the gfx906 MMQ and mat-vec kernels
+read directly, so prefill stops paying for per-block scale gathers. The Q8_0
+path was contributed by DENEB1312; MXFP4, the K-quant types and the legacy
+Q5_1 follow it through per-type kernel traits. On by default on gfx906,
+carried by the extra buffer types like upstream's CPU weight repack, so
+`--no-repack` disables it
+(`-nr 1` in llama-bench); a draft model always loads canonical weights. Model
+load stages canonical bytes and repacks on the device, so `-sm layer` loads
+at vanilla-loader parity and tensor-parallel loads within about 1.4x of it.
+Every type is admitted under `-sm tensor` and multi-stage `-tps`, where each
+lane slice repacks. VRAM use stays at the canonical size for every type.
 
-MXFP4 weights repack the same way: rows carry the packed nibbles with a
-one-byte e8m0 scale plane after them, staying at the canonical 17 bytes per
-block so VRAM use does not grow. Measured against the canonical path:
-prefill +24% on a 35B MoE (one GPU) and +34% on gpt-oss-120b (two GPUs,
-layer split), generation +19% on a 27B dense model, perplexity within
-0.02%. Narrow batches and decode share the Q8_0 machinery through
-per-type kernel traits: 2-8 token verify batches take one mat-vec per
-expert assignment instead of the tiled GEMM (+41% at four tokens on the
-35B MoE), decode fuses the up and gate lanes (+6% generation on the 35B
-MoE), and tensor-split placement is admitted (+28% prefill on two GPUs
-with `-sm tensor`).
+| type | repacked layout | prefill vs canonical | generation vs canonical | numerics |
+|---|---|---|---|---|
+| Q8_0 | two planes, int8 quants and f16 scales | +12 to +41% (dense and MoE, 2x MI50, both split modes) | within a couple percent | prefill bit-exact, PPL unchanged |
+| MXFP4 | packed nibbles, one-byte e8m0 scale plane | +24% (35B MoE, 1 GPU), +34% (gpt-oss-120b, 2 GPU layer), +28% (2 GPU tensor) | +19% (27B dense) | PPL within 0.02% |
+| IQ4_NL | nibble plane, f16 scale plane, k-value table | +133% (1 GPU), +112% (2 GPU tensor) | +5% (1 GPU), -2% (2 GPU tensor) | byte-identical boots, PPL 7.4748 vs 7.4741 |
+| Q6_K | de-aliased lows, highs plane, per-16 scale pairs, f16 d plane | +69% (1 GPU), +59% (2 GPU tensor) | +6% (1 GPU), -2% (2 GPU tensor) | byte-identical boots, PPL 7.3822 vs 7.3823 |
+| Q5_K_M | Q4_K planes plus a fifth-bit word per sub-block | +55% (1 GPU), +50% (2 GPU tensor) | +1% (1 GPU), -5% (2 GPU tensor) | byte-identical boots, PPL 7.4895 vs 7.4929 |
+| Q4_K_M | de-aliased nibbles, scale/min record, half2 d and dmin | +2% (1 GPU), +5% (2 GPU tensor) | +7% (1 GPU), -2% (2 GPU tensor) | byte-identical boots, PPL 7.4319 vs 7.4267 |
+| Q5_1 | nibble plane, fifth-bit word, half2 d and m | +84% (1 GPU), +74% (2 GPU tensor) | flat (1 GPU and 2 GPU tensor) | byte-identical output on 1 GPU, PPL 6.6031 vs 6.6351 |
+
+The K-quant rows are Qwen3-14B on MI50, pp512, tg128, one card in layer
+mode and two cards with `-sm tensor -tps 2`; Q4_K and Q5_K carry the affine
+scale and min pair and fold the activation sum through the q8_1 block sums.
+The Q5_1 row is a Qwen3.6-27B requantized to Q5_1, as no released Q5_1 build
+of it exists; on a Qwen3.8-Flash-Next MoE carrying 43 Q5_1 tensors the same
+repack is +11% prefill on four cards with `-sm tensor`.
+Greedy generation can differ from the canonical kernels within
+floating-point reassociation on every type.
+
+Narrow batches, such as the multi-token steps a speculative verify produces,
+fuse the MoE up and gate lanes and size their mat-vec lane group from the
+tensor shape and the device: a lane needs enough accumulation steps to cover
+its reduction, and the grid that results still has to fill the compute
+units. That puts them at or ahead of the canonical path per decode step,
+worth about 6% on multi-token prediction with a 35B MoE; 2-8 token verify
+batches take one mat-vec per expert assignment instead of the tiled GEMM
+(+41% at four tokens on the 35B MoE). Perplexity is unchanged on MoE and
+moves within floating-point reassociation on dense (6.7010 to 6.6858 on a
+27B dense model at two tokens), while wide batches stay exact. Validated on
+gfx906.
+
+The fused up and gate mat-vec also admits Q4_K, Q5_K, Q6_K and IQ4_NL expert
+weights, on by default, `GGML_CUDA_REPACK_KQUANT_MOE_FUSION=0` turns it off.
+Qwen3.6-35B-A3B on one MI50, tg128 against the unfused path: Q4_K_M 80.9 ->
+86.6 t/s (+7.1%), Q5_K_M 76.7 -> 83.1 (+8.4%), Q6_K 75.5 -> 81.2 (+7.5%),
+IQ4_NL 84.8 -> 89.8 (+5.9%); two MI50 with `-sm layer` 74.5 -> 79.6 (+6.8%);
+prefill unchanged; with `-sm tensor` the gain is within run-to-run spread
+because the per-card slice shrinks while the AllReduce does not. Dense
+models and Q8_0 experts are untouched (within 1%). The fused kernels are
+bit-identical to the unfused ones at batch widths 2 to 4 and differ at
+width 1 by reduction order: perplexity scored one token at a time over ten
+2048-token chunks moves by 0.1 to 0.3% per type, inside the spread the
+repack itself has against the canonical kernels. Multi-token prediction
+output is unchanged. `GGML_CUDA_REPACK_MOE_FUSION_STATS=1` prints a
+per-width histogram of fused launches.

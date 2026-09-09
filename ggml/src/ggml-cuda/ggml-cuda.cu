@@ -31,6 +31,52 @@
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/q8_repack/repack.cuh"
+
+#include <atomic>
+
+// Opt-in per-type per-width histogram of fused MoE up/gate mat-vec launches, host side only, no synchronization.
+// GGML_CUDA_REPACK_MOE_FUSION_STATS=1 prints the non-zero cells every 8192 launches and at process exit.
+static std::atomic<uint64_t> g_repack_moe_fusion_hist[GGML_TYPE_COUNT][65];
+
+// The repack fused epilogue implements SWIGLU, GEGLU, and SWIGLU_OAI at its fixed alpha 1.702 and limit 7.0.
+// Anything else keeps its own GLU node.
+static bool ggml_cuda_repack_fusion_glu_ok(const ggml_tensor * glu) {
+    switch (ggml_get_glu_op(glu)) {
+        case GGML_GLU_OP_SWIGLU:
+        case GGML_GLU_OP_GEGLU:
+            return true;
+        case GGML_GLU_OP_SWIGLU_OAI:
+            return ggml_get_op_params_f32(glu, 2) == 1.702f && ggml_get_op_params_f32(glu, 3) == 7.0f;
+        default:
+            return false;
+    }
+}
+
+static void ggml_cuda_repack_moe_fusion_dump() {
+    for (int t = 0; t < GGML_TYPE_COUNT; t++) {
+        for (int c = 0; c <= 64; c++) {
+            const uint64_t n = g_repack_moe_fusion_hist[t][c].load(std::memory_order_relaxed);
+            if (n != 0) {
+                GGML_LOG_WARN("[repack-moe-fusion-stats] type=%s cols=%d launches=%llu\n",
+                              ggml_type_name((ggml_type) t), c, (unsigned long long) n);
+            }
+        }
+    }
+}
+
+static void ggml_cuda_repack_moe_fusion_count(ggml_type type, int cols) {
+    static std::atomic<uint64_t> total{0};
+    static std::atomic<bool> registered{false};
+    if (!registered.load(std::memory_order_relaxed) && !registered.exchange(true, std::memory_order_acq_rel)) {
+        atexit(ggml_cuda_repack_moe_fusion_dump);
+    }
+    if ((int) type < GGML_TYPE_COUNT) {
+        g_repack_moe_fusion_hist[type][cols < 0 ? 0 : (cols > 64 ? 64 : cols)].fetch_add(1, std::memory_order_relaxed);
+    }
+    if ((total.fetch_add(1, std::memory_order_relaxed) + 1) % 8192 == 0) {
+        ggml_cuda_repack_moe_fusion_dump();
+    }
+}
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
@@ -3903,7 +3949,7 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
 
         args.norm = true;
         for (const ggml_op op : norm_ops) {
-            if (nodes[node_idx]->op == op && nodes[node_idx]->src[0] == nodes[node_idx - 1]) {
+            if (node_idx < n_nodes && nodes[node_idx]->op == op && nodes[node_idx]->src[0] == nodes[node_idx - 1]) {
                 node_idx++;
             } else {
                 args.norm = false;
@@ -3912,14 +3958,14 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
         }
 
         // DIV <- CLAMP, RESHAPE
-        if (nodes[node_idx]->op != GGML_OP_DIV || nodes[node_idx]->src[1] != nodes[node_idx - 1] ||
+        if (node_idx >= n_nodes || nodes[node_idx]->op != GGML_OP_DIV || nodes[node_idx]->src[1] != nodes[node_idx - 1] ||
             nodes[node_idx]->src[0] != nodes[node_idx - 3]) {
             args.norm = false;
             return true;
         }
         node_idx++;
 
-        if (nodes[node_idx]->op != GGML_OP_RESHAPE || nodes[node_idx]->src[0] != nodes[node_idx - 1]) {
+        if (node_idx >= n_nodes || nodes[node_idx]->op != GGML_OP_RESHAPE || nodes[node_idx]->src[0] != nodes[node_idx - 1]) {
             args.norm = false;
             return true;
         }
@@ -3927,7 +3973,7 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
         node_idx++;
     }
 
-    if (nodes[node_idx]->op == GGML_OP_SCALE && nodes[node_idx]->src[0] == nodes[node_idx - 1]) {
+    if (node_idx < n_nodes && nodes[node_idx]->op == GGML_OP_SCALE && nodes[node_idx]->src[0] == nodes[node_idx - 1]) {
         args.scale = true;
     }
 
@@ -4011,10 +4057,13 @@ struct ggml_cuda_moe_weighted_reduction_match {
     int                 node_count   = 0;
 };
 
+// The last layer of a prefill micro-batch has no output rows, so its weighted reduction is empty.
+// Dropping the dependency node there alternates the node count and costs the cached allocation layout.
 static bool ggml_cuda_match_moe_weighted_reduction(
         const ggml_cgraph * cgraph,
         int node_idx,
-        ggml_cuda_moe_weighted_reduction_match & match) {
+        ggml_cuda_moe_weighted_reduction_match & match,
+        bool for_alloc_deps = false) {
     const ggml_tensor * first = cgraph->nodes[node_idx];
     if (first->op != GGML_OP_MUL || first->type != GGML_TYPE_F32 || !ggml_is_contiguous(first)) {
         return false;
@@ -4075,7 +4124,10 @@ static bool ggml_cuda_match_moe_weighted_reduction(
 
     const int     n_expert_used = (int) weighted->ne[1];
     const int64_t n_tokens      = weighted->ne[2] * weighted->ne[3];
-    if (n_expert_used < 2 || n_expert_used > MOE_WEIGHTED_REDUCTION_MAX_EXPERTS || n_tokens <= 0) {
+    if (n_expert_used < 2 || n_expert_used > MOE_WEIGHTED_REDUCTION_MAX_EXPERTS || n_tokens < 0) {
+        return false;
+    }
+    if (n_tokens == 0 && !for_alloc_deps) {
         return false;
     }
 
@@ -4395,6 +4447,16 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+// The fusion and its allocation dependencies are switched together, they are not sound apart.
+// GGML_CUDA_MOE_WEIGHTED_REDUCTION=0 selects the unfused MUL and ADD chain.
+static bool ggml_cuda_moe_weighted_reduction_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_MOE_WEIGHTED_REDUCTION");
+        return env == nullptr || std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -4405,7 +4467,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
-    if (node->op == GGML_OP_MUL) {
+    if (node->op == GGML_OP_MUL && ggml_cuda_moe_weighted_reduction_enabled()) {
         ggml_cuda_moe_weighted_reduction_match match;
         if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
             const int output_idx = i + match.node_count - 1;
@@ -4925,11 +4987,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             // the canonical path runs one, which is the whole of its decode
             // deficit - and a speculative verify step is 2 to 4 tokens wide, so
             // fusing only at one token never fired under MTP at all.
-            // Q8_0 only: the fused MMV has no MXFP4 port.
+            // The dense fusion admits Q8_0 and MXFP4, the MoE fusion admits every repacked type.
+            const bool fusion_types_ok = ids == nullptr
+                ? ggml_cuda_repack_mmv_fusion_supported(src0) && ggml_cuda_repack_mmv_fusion_supported(gate->src[0])
+                : ggml_cuda_repack_mmv_id_fusion_supported(src0) && ggml_cuda_repack_mmv_id_fusion_supported(gate->src[0]);
             if (ggml_cuda_repack_mul_mat_should_fire(src0) &&
                 ggml_cuda_repack_mul_mat_should_fire(gate->src[0]) &&
-                ggml_cuda_repack_mmv_fusion_supported(src0) &&
-                ggml_cuda_repack_mmv_fusion_supported(gate->src[0]) &&
+                fusion_types_ok &&
+                ggml_cuda_repack_fusion_glu_ok(glu) &&
                 ggml_cuda_repack_mmv_fusion_width_ok(
                     ids == nullptr ? glu->ne[1] : glu->ne[2], ids != nullptr, src0->type)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
@@ -4939,6 +5004,20 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 if (ids == nullptr) {
                     ggml_cuda_mul_mat_vec_repacked_fused(*cuda_ctx, src0, src1, glu, &fusion_data);
                 } else {
+                    // Activation witness for the K-quant expert fusion, once per type per process.
+                    // Lane worker threads reach this under parallel meta dispatch, so the once flag is an atomic exchange.
+                    static std::atomic<bool> witnessed[GGML_TYPE_COUNT];
+                    // A relaxed load guards the exchange so the steady state is a read, not a cache-line ownership transfer per call.
+                    if (src0->type < GGML_TYPE_COUNT && !witnessed[src0->type].load(std::memory_order_relaxed)
+                            && !witnessed[src0->type].exchange(true, std::memory_order_acq_rel)) {
+                        GGML_LOG_WARN("[repack-moe-fusion] type=%s cols=%d fused up/gate mat-vec engaged\n",
+                                      ggml_type_name(src0->type), (int) glu->ne[2]);
+                    }
+                    static const bool fusion_stats = getenv("GGML_CUDA_REPACK_MOE_FUSION_STATS") != nullptr
+                                                  && atoi(getenv("GGML_CUDA_REPACK_MOE_FUSION_STATS")) != 0;
+                    if (fusion_stats) {
+                        ggml_cuda_repack_moe_fusion_count(src0->type, (int) glu->ne[2]);
+                    }
                     ggml_cuda_mul_mat_id_vec_repacked_fused(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
                 }
                 fused_mul_mat_vec = true;
@@ -5579,14 +5658,14 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
-    if (!disable_fusion) {
+    if (!disable_fusion && ggml_cuda_moe_weighted_reduction_enabled()) {
         for (int i = 0; i < cgraph->n_nodes; ++i) {
             if (cgraph->nodes[i]->op != GGML_OP_MUL) {
                 continue;
             }
 
             ggml_cuda_moe_weighted_reduction_match match;
-            if (!ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
+            if (!ggml_cuda_match_moe_weighted_reduction(cgraph, i, match, /* for_alloc_deps = */ true)) {
                 continue;
             }
 
