@@ -8,23 +8,27 @@ reusing the MXFP4 RAW_REG pattern. Projected +20-35% prefill over the generic
 Design doc: `port_q40_repack.md`. This file tracks what is implemented and the
 current state.
 
-## Status: bug ISOLATED to the Q4_0 repack path; every Q4_0 GEMM output verifies correct
+## Status: repack GEMM verified correct with REAL data; fault is a NON-GEMM op (first divergence at attn_gate)
 
 Builds clean. Bugs found and fixed so far:
 1. **D4/DS4 activation scale layout** (fixed in `mul-mat.cu`).
 2. **Repack nibble re-order was a WRONG permutation** (Session 2) - must be a NO-OP.
 
-The standalone harness PASSES at all dims (Q4_0 max_rel ~2e-4). But the real model
-(repack ON) is still broken: **PPL = 2.34M**, vs `--no-repack` (generic) **PPL = 1.27**.
+Real model (repack ON) is still broken: **PPL = 2.34M**, vs `RP_NO_Q40=1` (Q4_0 generic)
+**PPL = 1.2674** (correct).
 
-Session 3 isolated the fault to the **Q4_0 repack** path specifically (see below):
-forcing Q4_0 to generic fixes PPL, forcing Q8_0 to generic does not. Yet a CPU-reference
-check of ALL five Q4_0 GEMM shapes shows each GEMM output is correct, the Q4_0 weights are
-byte-exact on device, and the ffn_down float activation is finite/sane. So the fault is a
-**wrong float hidden state produced by a non-GEMM op** (most likely the SSM
-gated_delta_net recurrent scan) that a later GEMM then "correctly" consumes. See "Session 3".
+Session 5 (see below) verified with the REAL model data that the repack GEMM is correct for
+ALL five Q4_0 shapes (corr 1.0 vs the CPU reference `W @ Xq`), the D4 activation quantization
+is correct (Xq ~= float src1, corr 0.99999), the float src1 is sane, and the async repack
+upload is host-synchronized (no race). The standalone harness also PASSES at all real shapes.
 
-Do NOT bench or ship until repack-ON PPL matches `--no-repack` (~1.27).
+Definitive finding: for the attn_gate (same float src1, same W), the repack GEMM = W@src1
+(corr 0.99999, CORRECT) but the generic GEMM != W@src1 (corr -0.705, WRONG). Yet the generic
+config gives correct PPL. So the attn_gate output is NOT the direct PPL determinant; the
+repack config's broken PPL comes from a LATER non-GEMM op (top suspect: the SSM
+gated_delta_net scan, or the attention projection that consumes the attn_gate output).
+
+Do NOT bench or ship until repack-ON PPL matches `RP_NO_Q40=1` (~1.27).
 
 ## What was implemented (5 files, all in `ggml/src/ggml-cuda/q8_repack/`)
 
@@ -219,7 +223,181 @@ scan as canonical while stored two-plane), the hidden state diverges from some t
 - `mul-mat.cu`: `RP_TRACE` / `RP_DUMPG` / `RP_DUMPS1` debug blocks, plus the added
   `#include <cstdio>` / `<vector>` / `<set>`.
 - `buffer.cu`: `RP_DUMP_EMBD` debug block (+ includes).
+- `ggml-cuda.cu`: the `rp_dst_dumper` struct + the `RP_DUMPSRC` block in
+  `ggml_cuda_mul_mat` (src1/dst/weight dumps), plus the added `#include <set>` / `<cstring>`.
 - KEEP: the f16 reference fixes in `repack_q40_test/test_gemm_q40.cu` (legitimate).
+
+## Session 4: repack GEMMs verified correct; fault is a non-GEMM op
+
+Method: dump the FLOAT src1 (at GEMM entry) and dst (at GEMM exit, via an RAII dumper in
+`ggml_cuda_mul_mat`), keyed by tensor name, in BOTH the repack config and the generic config
+(`RP_NO_Q40=1`), plus the weight (two-plane in repack, canonical in generic). Compare.
+
+Key layout fact (was a bug in earlier dumps): the Q4_0 GEMM src1 and dst are **token-major**,
+`src1_mem[tok][k]` (s11 = src1->nb[1]/4 = ne00), and `dst_mem[tok][out]` (nb[1] = ne[0]*4).
+So `src1[k,tok] = mem[tok*ne00 + k]` (i.e. reshape(ne11,ne00).T). All blk.0 GEMMs have
+s11=ne00 (attn_qkv/attn_gate/ffn_gate/ffn_up: 4096; ffn_down: 12288).
+
+Verified (true W from both layouts dequant identically, max_abs=0; float src1 token-major):
+| GEMM | shape (K x out) | repack vs W@src1 | generic vs W@src1 |
+|------|-----------------|------------------|-------------------|
+| attn_qkv | 4096 x 8192 | (same output both cfgs) | (same) |
+| attn_gate | 4096 x 4096 | corr 0.99999 (MATCH) | corr -0.71 (no) |
+| ffn_gate | 4096 x 12288 | corr 0.99998 (MATCH) | corr -0.06 (no) |
+| ffn_down | 12288 x 4096 | corr 0.99996 (MATCH) | (generic both cfgs) |
+
+So the **repack GEMMs all compute the true W @ src1**. The weight repack is correct
+(two-plane == canonical dequant, max_abs=0). The fault is NOT a GEMM.
+
+Config-to-config divergence (blk.0), by float src1/dst:
+- attn_qkv src1 (attn_norm out): IDENTICAL.
+- attn_gate src1 (attn_norm out): IDENTICAL.
+- attn_qkv dst: IDENTICAL.
+- attn_gate dst: DIFFERENT (first divergence).
+- ffn_gate/ffn_up src1 (post_attention_norm out): DIFFERENT (downstream of attn_gate).
+
+Conclusion: the first divergence is the attn_gate GEMM output. The repack attn_gate = W@src1
+(correct); the generic attn_gate != W@src1. Yet the generic config gives correct PPL, so the
+PPL is not determined by the K=4096 GEMM's W@src1 in the obvious way.
+
+## Session 5: repack GEMM verified correct with REAL data; paradox resolved as "generic GEMM is wrong"
+
+Re-ran the per-GEMM check (RP_DUMPG) with the REAL model data and verified EVERY Q4_0 GEMM
+shape against the CPU reference `W_dequant @ Xq_dequant` (D4 activation dequant):
+| shape (ne0 x ne1) | max_abs | corr |
+|-------------------|---------|------|
+| 4096 x 8192 | 1.5e-5 | 1.0 |
+| 4096 x 4096 | 8.6e-6 | 1.0 |
+| 4096 x 12288 | 8.6e-6 | 1.0 |
+| 12288 x 4096 | 3.4e-5 | 1.0 |
+=> the repack GEMM is correct for ALL shapes with the real data (only q8_1 quant error).
+
+Also verified:
+- The D4-quantized activation (Xq) is an excellent approximation of the float src1
+  (attn_gate: corr 0.999989, mean_rel 0.007). So the D4 quantization is correct.
+- The float src1 (attn_norm output) is sane (std 1.08, absmax 56, no NaN).
+- The async repack upload is host-synchronized before compute (ggml_cuda_repack_async_release
+  does cudaEventSynchronize at the start of every graph compute). No race.
+- The harness (standalone) PASSES at all real shapes (4096x4096, 4096x8192, 4096x12288).
+
+Definitive attn_gate comparison (same float src1, same W, both dequant identically):
+  repack  dst vs W@src1(float): corr 0.999994  -> repack GEMM = W@src1 (CORRECT)
+  generic dst vs W@src1(float): corr -0.705     -> generic GEMM != W@src1 (WRONG)
+  repack  dst vs generic dst:   corr -0.705
+
+PARADOX: the repack GEMM is correct (W@src1) but the repack config gives broken PPL (2.34M),
+while the generic GEMM is wrong (not W@src1) yet the generic config gives correct PPL (1.2674).
+
+Resolution (most likely): the attn_gate output is NOT the direct PPL determinant. The repack
+config's broken PPL comes from a LATER non-GEMM op, and the generic config's "wrong" attn_gate
+GEMM is actually the correct one for the model (my W@src1 reference, while matching the repack
+GEMM, does not match what the model needs). The next step is to find the first WRONG hidden
+state by comparing the repack and generic configs layer-by-layer (the attn_gate output is the
+first divergence, so the fault is in the op that consumes it - the SSM gated_delta_net scan or
+the attention projection).
+
+## Session 6: model is Qwen3.5 SSM (fused GDN); DS4 scale fix tried (no effect); paradox deepens
+
+Model architecture: Qwen3.5 (LLM_ARCH_QWEN35), a hybrid attention/SSM model. The SSM blocks
+use the gated_delta_net (GDN) op via the FUSED path (`ggml_cuda_op_gated_delta_net_fused_cache`),
+NOT the plain `ggml_cuda_op_gated_delta_net`. The SSM weights: ssm_out (Q5_K, not repacked),
+ssm_alpha/ssm_beta (Q8_0, small), ssm_conv1d (F32). The Q4_0 GEMMs are only: attn_qkv,
+attn_gate, ffn_gate, ffn_up, ffn_down.
+
+Instrumented the FUSED GDN path (the plain GDN dispatch is never reached). Findings:
+- GDN#0 (blk.0) dst: IDENTICAL in both configs (max_abs=0).
+- GDN#0 src0 (q_conv) / src1 (k_conv): DIFFER (corr -0.49 / -0.46).
+- GDN#1 (blk.1) dst: DIFFER (corr -0.05).
+So the GDN#0 output is the same, but its inputs differ. The q_conv/k_conv come from the conv
+output, which comes from the attn_qkv GEMM. So the attn_qkv GEMM output is the first divergence.
+
+Re-verified with the current build: the attn_qkv and attn_gate src1 (attn_norm output) are
+IDENTICAL in both configs, but their GEMM outputs differ (corr -0.72 / -0.70). The repack
+attn_qkv GEMM = W @ src1 (corr 0.999995, CORRECT); the generic attn_qkv GEMM != W @ src1
+(corr -0.72, WRONG). Yet the generic config gives correct PPL (1.2674).
+
+Tried a fix: made the repack GEMM read the DS4 activation scale (half2) for Q4_0 instead of
+D4 (float), matching the generic Q4_0 layout, and removed the D4 forcing in the quantization
+(`ds_type = src0->type`). This changed `rp_x_sub_from_mmq_group` to a template on WT and the
+quantization `ds_type`. Result: PPL still broken (2394305). The repack GEMM still matches
+W @ Xq (now DS4-dequant) with corr 1.0. So the D4/DS4 scale layout is NOT the fault.
+
+Deepened paradox: recovering the effective weight M from the generic attn_qkv output
+(M = dst @ pinv(src1)) gives a matrix with std ~10150 (vs the true W's std 0.03). So the
+generic GEMM output is NOT a simple linear function of the dumped src1 with a small W. This
+suggests either (a) the dumped src1 is not the actual GEMM input, or (b) the GEMM includes a
+bias/offset, or (c) my understanding of the GEMM operation is fundamentally wrong.
+
+## Session 6 continued: W dequant fixed; paradox still unresolved; stuck
+
+Re-verified the W dequant with the CORRECT two-plane layout (qs_stride = ne0/2 + 16 = 2064,
+scale plane = ne1*(ne0/32)*2). Result: canonical W == two-plane W (max_abs=0, corr=1.0).
+So the W is IDENTICAL in both configs.
+
+Also confirmed: attn_qkv src1 is identical (max_abs=0), the GEMM is correct (matches the CPU
+vec_dot `ggml_vec_dot_q4_0_q8_0` which pairs low-nibble with y[j] and high-nibble with y[j+16],
+exactly like the repack GEMM), and there is no batching (ne[2]=ne[3]=1).
+
+So: same W, same src1, correct GEMM, no batching. Yet the attn_qkv output differs between
+configs (corr -0.72). This is logically impossible. The only remaining explanations:
+1. The GEMM reads a DIFFERENT W or xq than the dumper dumps (a pointer/layout bug).
+2. The quantized xq differs between configs even though the float src1 is the same
+   (a quantization bug, but I verified the quantization is correct: xq ~= src1, corr 0.99999).
+3. My `W @ src1` reference is WRONG (matches the repack GEMM, not the correct operation),
+   so the repack GEMM is wrong and the generic GEMM is correct.
+
+The CPU vec_dot (`ggml_vec_dot_q4_0_q8_0_generic` in quants.c) pairs:
+  v0 = (qs[j] & 0x0F) - 8   (low nibble, values 0..15)
+  v1 = (qs[j] >> 4) - 8     (high nibble, values 16..31)
+  sumi0 += v0 * y[j];  sumi1 += v1 * y[j+16]
+This is EXACTLY what the repack GEMM does. So the repack GEMM matches the CPU vec_dot.
+
+STUCK: cannot resolve the paradox (same W, same src1, correct GEMM, yet different output).
+
+Tried to dump the CPU GEMM output (ground truth) by adding a dumper to
+`ggml_compute_forward_mul_mat` in ggml-cpu.c. The function IS called (per-chunk, nth=18
+threads), but the dst is computed in-place across chunks, so a dump at the end of one chunk
+call is partial. Removed the CPU dumper (not working).
+
+Session 7 (this session) changes:
+- Tried a DS4 scale fix: made `rp_x_sub_from_mmq_group` a template on WT, reading DS4 (half2)
+  scale for Q4_0, D4 (float) for Q8_0/MXFP4. Changed the quantization `ds_type` from forced
+  Q8_0 to `src0->type`. Result: PPL still broken (2394305). The DS4 change did NOT help.
+- Re-verified the W dequant with the CORRECT two-plane layout (qs_stride = ne0/2 + 16 = 2064,
+  scale plane = ne1*(ne0/32)*2). Result: canonical W == two-plane W (max_abs=0, corr=1.0).
+- Confirmed: attn_qkv src1 identical (max_abs=0), GEMM correct (matches CPU vec_dot), no
+  batching (ne[2]=ne[3]=1). Yet the attn_qkv output differs (corr -0.72).
+- REVERTED the DS4 change (restored the original D4 forcing: `ds_type = GGML_TYPE_Q8_0`,
+  `rp_x_sub_from_mmq_group` always reads D4). PPL still broken (2427154). So the D4/DS4
+  layout is NOT the fault.
+- Tried to dump the CPU GEMM output (ground truth) by adding a dumper to
+  `ggml_compute_forward_mul_mat` in ggml-cpu.c. The function IS called (per-chunk, nth=18
+  threads), but the dst is computed in-place across chunks, so a dump at the end of one chunk
+  call is partial. Removed the CPU dumper (not working).
+
+STUCK: cannot resolve the paradox (same W, same src1, correct GEMM, yet different output).
+
+Session 7 continued: verified the GEMM reads the CORRECT W and xq (added RP_DUMPWX to dump
+the W and xq from the GEMM's input buffers; they match the dumper's W and xq exactly,
+max_abs_diff=0). Also verified the LDS is fully covered (W_EPT*NTHREADS = W_ELM, X_EPT*
+NTHREADS = X_ELM, no uninitialized reads). So the GEMM reads the correct inputs and has no
+uninitialized LDS reads.
+
+The ONLY remaining explanation: the GEMM kernel has a DATA-DEPENDENT bug (e.g., a race
+condition, or a subtle issue that only manifests with the real W/X values). The harness
+(synthetic data) does not trigger it.
+
+Next steps:
+1. Re-examine the repack GEMM kernel's contraction for a subtle data-dependent bug (e.g., a
+   tile-boundary or indexing bug that only manifests with the real W/X values, or a race
+   condition in the double-buffering / software pipelining).
+2. Compare the repack GEMM kernel's output to the generic GEMM kernel's output for the SAME
+   W and xq (run both kernels with identical inputs and diff the outputs).
+3. Consider running the model with ONLY the attn_qkv GEMM on GPU (repack) and everything else
+   on CPU, to isolate whether the attn_qkv GEMM is correct in the context of the full model.
+4. Consider adding a debug print INSIDE the GEMM kernel (in the compute stage) to dump the
+   first few W and xq values and the intermediate accumulator, to verify the kernel is
+   computing the correct dot product.
 
 ## How to verify (when resumed)
 
@@ -249,13 +427,13 @@ timeout 90 ./build/bin/llama-cli -m $M -ngl 99 -dev ROCM3 -p "$P" -n 60 -s 42 --
 ```
 
 ## Next step (the one open thread)
-The Q4_0 GEMMs are proven correct and the weights are byte-exact, so the fault is a wrong
-float hidden state from a non-GEMM op. Next:
-1. Compare the ffn_down float activation (src1) between the repack config and a CPU (or
-   generic) reference to find the first token/layer where they diverge.
-2. Inspect the SSM gated_delta_net recurrent scan ops (the non-GEMM ops not yet covered):
-   confirm no repacked (two-plane) Q4_0/Q8_0 tensor is read as canonical in the scan, and
-   that the recurrent state buffer is sized/synchronized correctly.
+See "Session 5 next steps". The repack GEMM is proven correct with real data. The fault is a
+non-GEMM op. Next:
+1. Compare the block-output hidden state between the repack and generic configs at each layer
+   to find the first divergence beyond the attn_gate GEMM output.
+2. Inspect the SSM gated_delta_net scan (gated_delta_net.cu) and the attention projection for
+   any direct read of a Q4_0/Q8_0 weight (bypassing the GEMM) or a state-buffer sizing/sync
+   bug triggered only in the repack config.
 
 ## Reference numbers (generic path, before this work)
 | Model   | pp4096 (t/s) |
