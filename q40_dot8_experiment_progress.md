@@ -45,7 +45,7 @@ Modified files:
   - Supports `GGML_CUDA_Q4_0_INT4_SCALAR_REFERENCE`, which replaces the hardware instruction with an independent scalar signed-int4 dot for validation.
 - `ggml/src/ggml-cuda/mmq-vec-dot.cuh`
   - Adds the Q4_0/int4 activation dot8 path.
-  - Packs eight signed int4 values for the dot8 instruction.
+  - Packs eight signed int4 values for the dot8 instruction. The original bug was in `ggml_cuda_pack_i4x8`: the nibbles from the second input word were shifted in the wrong direction. The corrected implementation uses left shifts from the original nibble positions.
   - Converts Q4_0 weight nibbles from unsigned `0..15` to signed `-8..7`.
 - `ggml/src/ggml-cuda/mmq.cuh`
   - Selects the dot8 Q4_0 helper when the experiment macro is enabled.
@@ -75,6 +75,12 @@ Q4_1 control:
 907.74 t/s, pp512
 ```
 
+Corrected Q4_0 DP8 path:
+
+```text
+482.59 t/s, pp4096
+```
+
 The first implementation is approximately 41% slower than the original Q4_0 path. The current dot8 helper still performs packing and nibble rearrangement inside the matmul loop, so this is not yet an optimized implementation.
 
 ## Correctness and Quality
@@ -85,7 +91,7 @@ The initial implementation produced constant or garbled output. The following fi
 - Transposed Q4_0 low and high nibble groups before dot8 execution.
 - Restored hardware `V_DOT8_I32_I4` after using a scalar int4 reference for isolation.
 
-The latest single-turn test runs without a runtime failure and produces coherent text, but quality is visibly degraded compared with the normal Q4_0 path.
+The latest corrected implementation produces coherent output. The previous quality failure was caused by incorrect int4 nibble packing, not by the `V_DOT8_I32_I4` instruction.
 
 Test command:
 
@@ -113,13 +119,33 @@ Q4_1 GPU control:
 PPL = 3.6124 +/- 0.18639
 ```
 
-An earlier experimental Q4_0 GPU run reported:
+The earlier experimental Q4_0 GPU run reported:
 
 ```text
 PPL = 110748.1269 +/- 13526.84042
 ```
 
 That result was collected before the final activation-scale correction from `amax / 7` to `amax / 8`, so it is provisional and must not be treated as the final quality number.
+
+After fixing `ggml_cuda_pack_i4x8`, the corrected DP8 run produced:
+
+```text
+[1] 7.4700
+[2] 4.9565
+[3] 3.9743
+[4] 3.6901
+[5] 4.0684
+[6] 4.0857
+[7] 4.1350
+[8] 4.0132
+
+PPL = 4.0132 +/- 0.21808
+```
+
+Compared with the corrected CPU Q4_0 control (`PPL = 3.6947`), the remaining
+degradation is consistent with the intended lower precision of the activation
+quantizer. The catastrophic `110748` PPL was caused by the packing bug and is
+superseded by this result.
 
 ## Next Steps
 

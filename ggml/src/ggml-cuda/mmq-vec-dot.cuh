@@ -63,8 +63,8 @@ static __device__ __forceinline__ int ggml_cuda_pack_i4x8(const int a, const int
     const uint32_t ub = (uint32_t) b;
     return (ua & 0x0000000F) | ((ua >> 4) & 0x000000F0) |
         ((ua >> 8) & 0x00000F00) | ((ua >> 12) & 0x0000F000) |
-        ((ub & 0x0000000F) << 16) | ((ub >> 4) & 0x00F00000) |
-        ((ub >> 8) & 0x0F000000) | ((ub >> 12) & 0xF0000000);
+        ((ub & 0x0000000F) << 16) | ((ub & 0x00000F00) << 12) |
+        ((ub & 0x000F0000) << 8) | ((ub & 0x0F000000) << 4);
 }
 
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q4_0_q4_0_dp8(
