@@ -755,7 +755,17 @@ static __device__ __forceinline__ int ggml_cuda_dp4a(const int a, const int b, i
 
 #if defined(GGML_CUDA_Q4_0_INT4_ACTIVATIONS) && defined(__gfx906__)
 static __device__ __forceinline__ int ggml_cuda_dp8_i4(const int a, const int b, int c) {
+#if defined(GGML_CUDA_Q4_0_INT4_SCALAR_REFERENCE)
+    for (int i = 0; i < 8; ++i) {
+        int ai = (a >> (4*i)) & 0xF;
+        int bi = (b >> (4*i)) & 0xF;
+        ai = ai >= 8 ? ai - 16 : ai;
+        bi = bi >= 8 ? bi - 16 : bi;
+        c += ai * bi;
+    }
+#else
     asm("v_dot8_i32_i4 %0, %1, %2, %0" : "+v"(c) : "v"(a), "v"(b));
+#endif
     return c;
 }
 #endif
