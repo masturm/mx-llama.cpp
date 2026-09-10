@@ -57,6 +57,74 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     }
 }
 
+#if defined(GGML_CUDA_Q4_0_INT4_ACTIVATIONS) && defined(__gfx906__)
+static __device__ __forceinline__ int ggml_cuda_pack_i4x8(const int a, const int b) {
+    const uint32_t ua = (uint32_t) a;
+    const uint32_t ub = (uint32_t) b;
+    return (ua & 0x0000000F) | ((ua >> 4) & 0x000000F0) |
+        ((ua >> 8) & 0x00000F00) | ((ua >> 12) & 0x0000F000) |
+        ((ub & 0x0000000F) << 16) | ((ub >> 4) & 0x00F00000) |
+        ((ub >> 8) & 0x0F000000) | ((ub >> 12) & 0xF0000000);
+}
+
+template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q4_0_q4_0_dp8(
+        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps    = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
+    constexpr int I         = ggml_cuda_mmq_get_I(type, J, fallback);
+
+    constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_Q4_0, I);
+    const int * x_qs = (const int *) x;
+    const float * x_df = (const float *) x_qs + txs.qs;
+    const int * y_qs = (const int *) y + 4;
+    const half2 * y_ds = (const half2 *) y;
+
+    for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QR4_0*VDR_Q4_0_Q8_1_MMQ) {
+        const int k0 = k00 + k01;
+
+#pragma unroll
+        for (int j0 = 0; j0 < J; j0 += nwarps) {
+            const int j = j0 + threadIdx.y;
+
+#pragma unroll
+            for (int i0 = 0; i0 < I; i0 += warp_size) {
+                const int i = i0 + threadIdx.x;
+                const int kyqs = QI8_1 * ((k01/2) / (QI8_1/2)) + (k01/2) % (QI8_1/2);
+                int u[2*VDR_Q4_0_Q8_1_MMQ];
+
+                constexpr int max_cpy = ggml_cuda_get_max_cpy_bytes();
+                constexpr int mcpy_int = max_cpy / sizeof(int);
+                int tmp0[4], tmp1[4];
+
+#pragma unroll
+                for (int l0 = 0; l0 < 4 / mcpy_int; ++l0) {
+                    ggml_cuda_memcpy_1<max_cpy>(tmp0 + l0 * mcpy_int, &y_qs[j*MMQ_TILE_Y_K + kyqs + l0 * mcpy_int]);
+                    ggml_cuda_memcpy_1<max_cpy>(tmp1 + l0 * mcpy_int, &y_qs[j*MMQ_TILE_Y_K + kyqs + QI4_0 + l0 * mcpy_int]);
+                }
+
+                u[0] = ggml_cuda_pack_i4x8(tmp0[0], tmp1[0]);
+                u[1] = ggml_cuda_pack_i4x8(tmp0[1], tmp1[1]);
+                u[2] = ggml_cuda_pack_i4x8(tmp0[2], tmp1[2]);
+                u[3] = ggml_cuda_pack_i4x8(tmp0[3], tmp1[3]);
+
+                int sumi = 0;
+#pragma unroll
+                for (int l0 = 0; l0 < VDR_Q4_0_Q8_1_MMQ; ++l0) {
+                    const int v = x_qs[i*(MMQ_TILE_NE_K + 1) + k0/QR4_0 + l0];
+                    const int vi0 = v & 0x0F0F0F0F;
+                    const int vi1 = (v >> 4) & 0x0F0F0F0F;
+                    const int vi = ggml_cuda_pack_i4x8(vi0 ^ 0x08080808, vi1 ^ 0x08080808);
+                    sumi = ggml_cuda_dp8_i4(vi, u[l0], sumi);
+                }
+
+                const float2 ds8f = __half22float2(y_ds[j*MMQ_TILE_Y_K + k01/QI8_1]);
+                sum[j0/nwarps*I/warp_size + i0/warp_size] += x_df[i*(MMQ_TILE_NE_K/QI4_0) + i/QI4_0 + k0/(QR4_0*QI4_0)] * sumi * ds8f.x;
+            }
+        }
+    }
+}
+#endif
+
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q4_1_q8_1_dp4a(
         const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();

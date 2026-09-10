@@ -563,11 +563,19 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
                     ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a<type, J, fallback>,
                     ggml_cuda_mmq_write_back_dp4a<type, J, fallback>);
             case GGML_TYPE_Q4_0:
+#if defined(GGML_CUDA_Q4_0_INT4_ACTIVATIONS) && defined(__gfx906__)
+                return ggml_cuda_mmq_util_funcs(
+                    VDR_Q4_0_Q8_1_MMQ,
+                    ggml_cuda_mmq_load_tiles_q4_0<type, J, fallback>,
+                    ggml_cuda_mmq_vec_dot_q4_0_q4_0_dp8<type, J, fallback>,
+                    ggml_cuda_mmq_write_back_dp4a<type, J, fallback>);
+#else
                 return ggml_cuda_mmq_util_funcs(
                     VDR_Q4_0_Q8_1_MMQ,
                     ggml_cuda_mmq_load_tiles_q4_0<type, J, fallback>,
                     ggml_cuda_mmq_vec_dot_q4_0_q8_1_dp4a<type, J, fallback>,
                     ggml_cuda_mmq_write_back_dp4a<type, J, fallback>);
+#endif
             case GGML_TYPE_Q4_1:
                 return ggml_cuda_mmq_util_funcs(
                     VDR_Q4_1_Q8_1_MMQ,

@@ -455,7 +455,7 @@ static __global__ void quantize_mmq_mxfp4(const float * __restrict__ x,
 }
 
 // scatter: grid over tokens, quantize once, write to all the token's compact rows
-template <mmq_q8_1_ds_layout ds_layout, bool scatter>
+template <mmq_q8_1_ds_layout ds_layout, bool scatter, bool q4_0>
 static __global__ void quantize_mmq_q8_1(
         const float * __restrict__ x, const int32_t * __restrict__ ids, void * __restrict__ vy,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
@@ -513,13 +513,20 @@ static __global__ void quantize_mmq_q8_1(
         }
     }
 
-    const float d_inv = 127.0f / amax;
+    const float d_inv = q4_0 ? (amax == 0.0f ? 0.0f : 8.0f / amax) : (127.0f / amax);
     char4 q;
-    q.x = roundf(xi.x*d_inv);
-    q.y = roundf(xi.y*d_inv);
-    q.z = roundf(xi.z*d_inv);
-    q.w = roundf(xi.w*d_inv);
-    const float d = 1.0f / d_inv;
+    if constexpr (q4_0) {
+        q.x = max(-8, min(7, (int) roundf(xi.x*d_inv)));
+        q.y = max(-8, min(7, (int) roundf(xi.y*d_inv)));
+        q.z = max(-8, min(7, (int) roundf(xi.z*d_inv)));
+        q.w = max(-8, min(7, (int) roundf(xi.w*d_inv)));
+    } else {
+        q.x = roundf(xi.x*d_inv);
+        q.y = roundf(xi.y*d_inv);
+        q.z = roundf(xi.z*d_inv);
+        q.w = roundf(xi.w*d_inv);
+    }
+    const float d = d_inv == 0.0f ? 0.0f : 1.0f / d_inv;
 
     // write the block once (normal) or to each of the token's compact rows (scatter)
     const int nwrite = scatter ? n_expert_used : 1;
@@ -597,15 +604,22 @@ void quantize_mmq_q8_1_cuda(
     const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
     switch (mmq_get_q8_1_ds_layout(type_src0)) {
         case MMQ_Q8_1_DS_LAYOUT_D4:
-            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4, false>
+            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4, false, false>
                 <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
             break;
         case MMQ_Q8_1_DS_LAYOUT_DS4:
-            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4, false>
+#if defined(GGML_CUDA_Q4_0_INT4_ACTIVATIONS)
+            if (type_src0 == GGML_TYPE_Q4_0) {
+                quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4, false, true>
+                    <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
+                break;
+            }
+#endif
+            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4, false, false>
                 <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
             break;
         case MMQ_Q8_1_DS_LAYOUT_D2S6:
-            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D2S6, false>
+            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D2S6, false, false>
                 <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
             break;
         default:
@@ -627,15 +641,22 @@ void quantize_scatter_mmq_q8_1_cuda(
     const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
     switch (mmq_get_q8_1_ds_layout(type_src0)) {
         case MMQ_Q8_1_DS_LAYOUT_D4:
-            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4, true><<<num_blocks, block_size, 0, stream>>>(
+            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4, true, false><<<num_blocks, block_size, 0, stream>>>(
                 x, ids_src1_inv, vy, ne00, /*s01=*/0, /*s02=*/stride_token, /*s03=*/0, ne0, /*ne1=*/(int) nrows_dst, /*ne2=*/1, n_expert_used);
             break;
         case MMQ_Q8_1_DS_LAYOUT_DS4:
-            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4, true><<<num_blocks, block_size, 0, stream>>>(
+#if defined(GGML_CUDA_Q4_0_INT4_ACTIVATIONS)
+            if (type_src0 == GGML_TYPE_Q4_0) {
+                quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4, true, true><<<num_blocks, block_size, 0, stream>>>(
+                    x, ids_src1_inv, vy, ne00, /*s01=*/0, /*s02=*/stride_token, /*s03=*/0, ne0, /*ne1=*/(int) nrows_dst, /*ne2=*/1, n_expert_used);
+                break;
+            }
+#endif
+            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4, true, false><<<num_blocks, block_size, 0, stream>>>(
                 x, ids_src1_inv, vy, ne00, /*s01=*/0, /*s02=*/stride_token, /*s03=*/0, ne0, /*ne1=*/(int) nrows_dst, /*ne2=*/1, n_expert_used);
             break;
         case MMQ_Q8_1_DS_LAYOUT_D2S6:
-            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D2S6, true><<<num_blocks, block_size, 0, stream>>>(
+            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D2S6, true, false><<<num_blocks, block_size, 0, stream>>>(
                 x, ids_src1_inv, vy, ne00, /*s01=*/0, /*s02=*/stride_token, /*s03=*/0, ne0, /*ne1=*/(int) nrows_dst, /*ne2=*/1, n_expert_used);
             break;
         default:

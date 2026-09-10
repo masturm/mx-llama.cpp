@@ -753,6 +753,13 @@ static __device__ __forceinline__ int ggml_cuda_dp4a(const int a, const int b, i
 #endif // defined(GGML_USE_HIP)
 }
 
+#if defined(GGML_CUDA_Q4_0_INT4_ACTIVATIONS) && defined(__gfx906__)
+static __device__ __forceinline__ int ggml_cuda_dp8_i4(const int a, const int b, int c) {
+    asm("v_dot8_i32_i4 %0, %1, %2, %0" : "+v"(c) : "v"(a), "v"(b));
+    return c;
+}
+#endif
+
 static __device__ __forceinline__ void ggml_cuda_mad(float & acc, const float v, const float u) {
     acc += v*u;
 }
@@ -1622,6 +1629,7 @@ struct ggml_backend_cuda_context {
             CUBLAS_CHECK(cublasSetWorkspace(cublas_handles[device][curr_stream_no], cublas_workspaces[device][curr_stream_no], cublas_workspace_sizes[device]));
 #endif
         }
+
         return cublas_handles[device][curr_stream_no];
     }
 
