@@ -558,9 +558,9 @@ static __global__ void quantize_mmq_q8_1(
     [[maybe_unused]] uint32_t q4_peer;
     if constexpr (q4_0){
         q4 = static_cast<uint8_t>(q.x) | 
-            static_cast<uint32_t>((static_cast<uint8_t>(q.y)) << 8) | 
-            static_cast<uint32_t>((static_cast<uint8_t>(q.z)) << 16) | 
-            static_cast<uint32_t>((static_cast<uint8_t>(q.w)) << 24);
+            static_cast<uint32_t>(static_cast<uint8_t>(q.y)) << 8 | 
+            static_cast<uint32_t>(static_cast<uint8_t>(q.z)) << 16 | 
+            static_cast<uint32_t>(static_cast<uint8_t>(q.w)) << 24;
         q4_peer = __shfl_xor_sync(0xFFFFFFFF, q4, vals_per_scale/8, WARP_SIZE);
     }
 
@@ -578,12 +578,6 @@ static __global__ void quantize_mmq_q8_1(
         }
 
         if constexpr (q4_0) {
-            const uint32_t q4 = static_cast<uint8_t>(q.x) | 
-                static_cast<uint32_t>((static_cast<uint8_t>(q.y)) << 8) | 
-                static_cast<uint32_t>((static_cast<uint8_t>(q.z) & 0x0F) << 16) | 
-                static_cast<uint32_t>((static_cast<uint8_t>(q.w) & 0x0F) << 24);
-            const uint32_t q4_peer = __shfl_xor_sync(0xFFFFFFFF, q4, vals_per_scale/8, WARP_SIZE);
-
             if(iqs % vals_per_scale < vals_per_scale/2) {
                 int * yqs = y4[ib].qs;
                 yqs[(iqs/vals_per_scale)*(vals_per_scale/8) + (iqs % vals_per_scale)/4] = ggml_cuda_pack_i4x8((int) q4, (int) q4_peer);
