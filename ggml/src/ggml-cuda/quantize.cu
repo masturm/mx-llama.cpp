@@ -523,7 +523,7 @@ static __global__ void quantize_mmq_q8_1(
         }
     }
 
-    float sum;
+    float sum = 0.0f;
     if (ds_layout != MMQ_Q8_1_DS_LAYOUT_D4) {
         sum = xi.x + xi.y + xi.z + xi.w;
 
@@ -655,8 +655,8 @@ void quantize_mmq_q8_1_cuda(
                 <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
             break;
         case MMQ_Q8_1_DS_LAYOUT_DS4:
-#if defined(GGML_CUDA_Q4_0_INT4_ACTIVATIONS) && defined(__gfx906__)
-            if (type_src0 == GGML_TYPE_Q4_0) {
+#if defined(GGML_CUDA_Q4_0_INT4_ACTIVATIONS)
+            if (type_src0 == GGML_TYPE_Q4_0 && ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_VEGA20) {
                 quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4, false, true>
                     <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
                 break;
@@ -692,8 +692,8 @@ void quantize_scatter_mmq_q8_1_cuda(
                 x, ids_src1_inv, vy, ne00, /*s01=*/0, /*s02=*/stride_token, /*s03=*/0, ne0, /*ne1=*/(int) nrows_dst, /*ne2=*/1, n_expert_used);
             break;
         case MMQ_Q8_1_DS_LAYOUT_DS4:
-#if defined(GGML_CUDA_Q4_0_INT4_ACTIVATIONS) && defined(__gfx906__)
-            if (type_src0 == GGML_TYPE_Q4_0) {
+#if defined(GGML_CUDA_Q4_0_INT4_ACTIVATIONS)
+            if (type_src0 == GGML_TYPE_Q4_0 && ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_VEGA20) {
                 quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4, true, true><<<num_blocks, block_size, 0, stream>>>(
                     x, ids_src1_inv, vy, ne00, /*s01=*/0, /*s02=*/stride_token, /*s03=*/0, ne0, /*ne1=*/(int) nrows_dst, /*ne2=*/1, n_expert_used);
                 break;

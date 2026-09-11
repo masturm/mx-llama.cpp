@@ -65,7 +65,7 @@ static_assert(sizeof(block_fp4_mmq)  == sizeof(block_q8_1_mmq),    "Unexpected b
 static_assert(sizeof(block_q4_0_mmq_dp8)  == QK8_1_MMQ/2 + 4* sizeof(half2),    "Unexpected block_q4_0_mmq_dp8 size");
 
 static constexpr __host__ __device__ bool mmq_use_q4_0_dp8(const ggml_type type, const int cc) {
-#if defined(GGML_CUDA_Q4_0_INT4_ACTIVATIONS) && defined(__gfx906__)
+#if defined(GGML_CUDA_Q4_0_INT4_ACTIVATIONS)
     return type == GGML_TYPE_Q4_0 && cc == GGML_CUDA_CC_VEGA20;
 #else
     GGML_UNUSED(type);
