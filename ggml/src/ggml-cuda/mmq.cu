@@ -129,13 +129,14 @@ void ggml_cuda_mul_mat_q(
     const bool fallback = ne01 % 128 != 0;
 
     const bool use_native_fp4 = blackwell_mma_available(cc) && (src0->type == GGML_TYPE_MXFP4 || src0->type == GGML_TYPE_NVFP4);
-    const size_t y_block_size       = use_native_fp4 ? sizeof(block_fp4_mmq) : sizeof(block_q8_1_mmq);
+    const bool use_q4_0_dp8 = mmq_use_q4_0_dp8(src0->type, cc);
+    const size_t y_block_size       = use_native_fp4 ? sizeof(block_fp4_mmq) : use_q4_0_dp8 ? sizeof(block_q4_0_mmq_dp8) : sizeof(block_q8_1_mmq);
     const size_t y_values_per_block = use_native_fp4 ? QK_FP4_MMQ            : QK8_1_MMQ;
 
     if (!ids) {
         const auto workspace_nbytes = [&](const int64_t ncols) {
             return ne13*ne12 * ncols*ne10_padded * y_block_size/y_values_per_block +
-                ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ncols) * sizeof(block_q8_1_mmq);
+                ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ncols) * y_block_size;
         };
 
         ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
@@ -153,7 +154,7 @@ void ggml_cuda_mul_mat_q(
             const int64_t qs12 = src1->nb[2] / ts_src1;
             const int64_t qs13 = src1->nb[3] / ts_src1;
             if (!use_native_fp4 && ctx.mmq_workspace_cols_cap == 0) {
-                const int variant = 1 + (int) mmq_get_q8_1_ds_layout(src0->type);
+                const int variant = 1 + (int) mmq_get_q8_1_ds_layout(src0->type) + 4*use_q4_0_dp8;
                 src1_q8_1_ptr = ggml_cuda_q8_1_cache_acquire(ctx, src1, variant, ne10_padded,
                                                              qs11, qs12, qs13, workspace_nbytes(ne11),
                                                              src1_q8_1_hit, &cache_pressure);
@@ -213,7 +214,7 @@ void ggml_cuda_mul_mat_q(
             // destination channel/sample strides keep their original tensor layout.
             const int64_t ys12 = use_native_fp4 ?
                 iter_ne11 * ne10_padded * sizeof(block_fp4_mmq) / (QK_FP4_MMQ * sizeof(int)) :
-                iter_ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
+                iter_ne11 * ne10_padded * y_block_size / (QK8_1_MMQ * sizeof(int));
             const int64_t ys13 = ne12*ys12;
 
             const mmq_args args = {
@@ -240,7 +241,7 @@ void ggml_cuda_mul_mat_q(
     const bool dedup_bcast = ne11 == 1 && n_expert_used > 1;
     const auto quant_workspace_nbytes = [&](const int64_t n_tokens) {
         return n_tokens*n_expert_used*ne10_padded * y_block_size/y_values_per_block +
-            ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11) * sizeof(block_q8_1_mmq);
+            ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11) * y_block_size;
     };
 
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
@@ -315,7 +316,7 @@ void ggml_cuda_mul_mat_q(
     static_assert(QK_FP4_MMQ == 8 * QK_MXFP4, "QK_FP4_MMQ needs to be 8 * QK_MXFP4");
     const int64_t workspace_s12 = use_native_fp4 ?
         ne11 * ne10_padded * sizeof(block_fp4_mmq) / (QK_FP4_MMQ * sizeof(int)) :
-        ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
+        ne11 * ne10_padded * y_block_size / (QK8_1_MMQ * sizeof(int));
 
     for (int64_t token = 0; token < ne12; token += chunk_ne12) {
         const int64_t iter_ne12 = std::min(chunk_ne12, ne12 - token);

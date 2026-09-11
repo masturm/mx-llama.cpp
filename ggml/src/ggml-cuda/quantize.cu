@@ -485,6 +485,7 @@ static __global__ void quantize_mmq_q8_1(
 
     const float4 * x4 = (const float4 *) x;
     block_q8_1_mmq * y = (block_q8_1_mmq *) vy;
+    block_q4_0_mmq_dp8 * y4 = (block_q4_0_mmq_dp8 *) vy;
 
     const int64_t k_block = i0 / QK8_1_MMQ; // column block in the channel
     const int64_t iqs     = i0 % QK8_1_MMQ; // quant index in block
@@ -496,10 +497,30 @@ static __global__ void quantize_mmq_q8_1(
     amax = fmaxf(amax, fabsf(xi.z));
     amax = fmaxf(amax, fabsf(xi.w));
 
+    float max_value = 0.0f;
+    if constexpr (q4_0){
+        max_value = xi.x;
+        if(fabsf(xi.y) > fabsf(max_value)) {
+            max_value = xi.y;
+        }
+        if(fabsf(xi.z) > fabsf(max_value)) {
+            max_value = xi.z;
+        }
+        if(fabsf(xi.w) > fabsf(max_value)) {
+            max_value = xi.w;
+        }
+    }
+
     // Exchange max. abs. value between vals_per_scale/4 threads.
 #pragma unroll
     for (int offset = vals_per_scale/8; offset > 0; offset >>= 1) {
         amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, offset, WARP_SIZE));
+        if constexpr (q4_0) {
+            const float candidate = __shfl_xor_sync(0xFFFFFFFF, max_value, offset, WARP_SIZE);
+            if(fabsf(candidate) > fabsf(max_value)) {
+                max_value = candidate;
+            }
+        }
     }
 
     float sum;
@@ -513,13 +534,18 @@ static __global__ void quantize_mmq_q8_1(
         }
     }
 
-    const float d_inv = q4_0 ? (amax == 0.0f ? 0.0f : 8.0f / amax) : (127.0f / amax);
+    float d_inv;
+    if constexpr (q4_0) {
+        d_inv = max_value == 0.0f ? 0.0f : -8.0f / max_value;
+    } else {
+        d_inv = 127.0f / amax;
+    }
     char4 q;
     if constexpr (q4_0) {
-        q.x = max(-8, min(7, (int) roundf(xi.x*d_inv)));
-        q.y = max(-8, min(7, (int) roundf(xi.y*d_inv)));
-        q.z = max(-8, min(7, (int) roundf(xi.z*d_inv)));
-        q.w = max(-8, min(7, (int) roundf(xi.w*d_inv)));
+        q.x = max(-8, min(7, (int) roundf(xi.x*d_inv + 8.5f) - 8));
+        q.y = max(-8, min(7, (int) roundf(xi.y*d_inv + 8.5f) - 8));
+        q.z = max(-8, min(7, (int) roundf(xi.z*d_inv + 8.5f) - 8));
+        q.w = max(-8, min(7, (int) roundf(xi.w*d_inv + 8.5f) - 8));
     } else {
         q.x = roundf(xi.x*d_inv);
         q.y = roundf(xi.y*d_inv);
@@ -541,11 +567,28 @@ static __global__ void quantize_mmq_q8_1(
             ib = ib0 + k_block*ne1 + blockIdx.x;
         }
 
-        // Write back 4 int8 values as a single 32 bit value for better memory bandwidth:
-        char4 * yqs4 = (char4 *) y[ib].qs;
-        yqs4[iqs/4] = q;
+        if constexpr (q4_0) {
+            const uint32_t q4 = static_cast<uint8_t>(q.x) | 
+                static_cast<uint32_t>((static_cast<uint8_t>(q.y)) << 8) | 
+                static_cast<uint32_t>((static_cast<uint8_t>(q.z) & 0x0F) << 16) | 
+                static_cast<uint32_t>((static_cast<uint8_t>(q.w) & 0x0F) << 24);
+            const uint32_t q4_peer = __shfl_xor_sync(0xFFFFFFFF, q4, vals_per_scale/8, WARP_SIZE);
 
-        if (ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6) {
+            if(iqs % vals_per_scale < vals_per_scale/2) {
+                int * yqs = y4[ib].qs;
+                yqs[(iqs/vals_per_scale)*(vals_per_scale/8) + (iqs % (vals_per_scale/4))] = ggml_cuda_pack_i4x8((int) q4, (int) q4_peer);
+            }
+        } else {
+            // Write back 4 int8 values as a single 32 bit value for better memory bandwidth:
+            char4 * yqs4 = (char4 *) y[ib].qs;
+            yqs4[iqs/4] = q;
+        }
+
+        if constexpr (q4_0) {
+            if(iqs % 32 == 0) {
+                y4[ib].ds4[iqs/32] = make_half2(d, sum);
+            }
+        } else if (ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6) {
             if (iqs % 16 == 0 && iqs < 96) {
                 y[ib].d2s6[2 + iqs/16] = sum;
                 if (iqs % 64 == 0) {
@@ -608,7 +651,7 @@ void quantize_mmq_q8_1_cuda(
                 <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
             break;
         case MMQ_Q8_1_DS_LAYOUT_DS4:
-#if defined(GGML_CUDA_Q4_0_INT4_ACTIVATIONS)
+#if defined(GGML_CUDA_Q4_0_INT4_ACTIVATIONS) && defined(__gfx906__)
             if (type_src0 == GGML_TYPE_Q4_0) {
                 quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4, false, true>
                     <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
@@ -645,7 +688,7 @@ void quantize_scatter_mmq_q8_1_cuda(
                 x, ids_src1_inv, vy, ne00, /*s01=*/0, /*s02=*/stride_token, /*s03=*/0, ne0, /*ne1=*/(int) nrows_dst, /*ne2=*/1, n_expert_used);
             break;
         case MMQ_Q8_1_DS_LAYOUT_DS4:
-#if defined(GGML_CUDA_Q4_0_INT4_ACTIVATIONS)
+#if defined(GGML_CUDA_Q4_0_INT4_ACTIVATIONS) && defined(__gfx906__)
             if (type_src0 == GGML_TYPE_Q4_0) {
                 quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4, true, true><<<num_blocks, block_size, 0, stream>>>(
                     x, ids_src1_inv, vy, ne00, /*s01=*/0, /*s02=*/stride_token, /*s03=*/0, ne0, /*ne1=*/(int) nrows_dst, /*ne2=*/1, n_expert_used);

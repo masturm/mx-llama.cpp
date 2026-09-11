@@ -753,6 +753,15 @@ static __device__ __forceinline__ int ggml_cuda_dp4a(const int a, const int b, i
 #endif // defined(GGML_USE_HIP)
 }
 
+static __device__ __forceinline__ int ggml_cuda_pack_i4x8(const int a, const int b) {
+    const uint32_t ua = (uint32_t) a;
+    const uint32_t ub = (uint32_t) b;
+    return (ua & 0x0000000F) | ((ua >> 4) & 0x000000F0) |
+        ((ua >> 8) & 0x00000F00) | ((ua >> 12) & 0x0000F000) |
+        ((ub & 0x0000000F) << 16) | ((ub & 0x00000F00) << 12) |
+        ((ub & 0x000F0000) << 8) | ((ub & 0x0F000000) << 4);
+}
+
 #if defined(GGML_CUDA_Q4_0_INT4_ACTIVATIONS) && defined(__gfx906__)
 static __device__ __forceinline__ int ggml_cuda_dp8_i4(const int a, const int b, int c) {
 #if defined(GGML_CUDA_Q4_0_INT4_SCALAR_REFERENCE)

@@ -45,6 +45,12 @@ struct block_q8_1_mmq {
     int8_t qs[QK8_1_MMQ];
 };
 
+// Q4_0_DP8 activations store 16 packed signed int4 operands and four scales
+struct block_q4_0_mmq_dp8 {
+    half2 ds4[4];
+    int   qs[QK8_1_MMQ / 8];
+};
+
 // this struct is used for fp4 data types (currently only used for Blackwell)
 // mxfp4 has block size 32, each int32 of d4 contains 2 e8m0 scales in the lower 16 bits
 // nvfp4 has block size 16, each int32 of d4 contains 4 ue4m3 scales
@@ -56,6 +62,25 @@ struct block_fp4_mmq {
 static_assert(sizeof(block_q8_1_mmq) == QK8_1_MMQ + 4*sizeof(half2), "Unexpected block_q8_1_mmq size");
 static_assert(sizeof(block_q8_1_mmq) == 4*sizeof(block_q8_1),      "Unexpected block_q8_1_mmq size");
 static_assert(sizeof(block_fp4_mmq)  == sizeof(block_q8_1_mmq),    "Unexpected block_fp4_mmq size");
+static_assert(sizeof(block_q4_0_mmq_dp8)  == QK8_1_MMQ/2 + 4* sizeof(half2),    "Unexpected block_q4_0_mmq_dp8 size");
+
+static constexpr __host__ __device__ bool mmq_use_q4_0_dp8(const ggml_type type, const int cc) {
+#if defined(GGML_CUDA_Q4_0_INT4_ACTIVATIONS) && defined(__gfx906__)
+    return type == GGML_TYPE_Q4_0 && cc == GGML_CUDA_CC_VEGA20;
+#else
+    GGML_UNUSED(type);
+    GGML_UNUSED(cc);
+    return false;
+#endif
+}
+
+template <ggml_type type> static constexpr __device__ int mmq_get_y_block_size() {
+#if defined(GGML_CUDA_Q4_0_INT4_ACTIVATIONS) && defined(__gfx906__)
+    return type == GGML_TYPE_Q4_0 ? sizeof(block_q4_0_mmq_dp8) : sizeof(block_q8_1_mmq);
+#else
+    return sizeof(block_q8_1_mmq);
+#endif
+}
 
 static mmq_q8_1_ds_layout mmq_get_q8_1_ds_layout(const ggml_type type_x) {
     switch (type_x) {
@@ -118,6 +143,7 @@ struct tile_x_sizes {
 // block_q8_1_mmq has (128 8-bit ints == 32 32-bit ints + 4 32-bit scales)
 #define MMQ_TILE_Y_K     (MMQ_TILE_NE_K + MMQ_TILE_NE_K / QI8_1)
 #define MMQ_TILE_Y_FP4_K MMQ_TILE_Y_K
+#define MMQ_TILE_Y_DP8_K (sizeof(block_q4_0_mmq_dp8) / sizeof(int))
 
 enum ggml_cuda_mmq_sram_layout {
     GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0,
@@ -902,7 +928,8 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
     extern __shared__ int data_mul_mat_q[];
     int * tile_y = data_mul_mat_q + J;
-    int * tile_x = tile_y + GGML_PAD(J*MMQ_TILE_Y_K, nwarps*warp_size);
+    constexpr int tile_y_k =  mmq_get_y_block_size<type>() / sizeof(int);
+    int * tile_x = tile_y + GGML_PAD(J*tile_y_k, nwarps*warp_size);
 
 #if defined(BLACKWELL_MMA_AVAILABLE)
     // FP4 tile stores 8 blocks
@@ -916,14 +943,14 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
     float sum[J*I / (nwarps*warp_size)] = {0.0f};
 
-    constexpr int sz = sizeof(block_q8_1_mmq) / sizeof(int);
+    constexpr int sz =  mmq_get_y_block_size<type>() / sizeof(int);
 
     for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
         load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
         {
             const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
 #pragma unroll
-            for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
+            for (int l0 = 0; l0 < J * tile_y_k; l0 += nwarps * warp_size) {
                 int l = l0 + threadIdx.y*warp_size + threadIdx.x;
 
                 tile_y[l] = by0[l];
@@ -939,7 +966,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
         {
             const int * by0 = y + ncols_y * ((kb0 * qk / ne_block) * sz + sz);
 #pragma unroll
-            for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
+            for (int l0 = 0; l0 < J * tile_y_k; l0 += nwarps * warp_size) {
                 int l = l0 + threadIdx.y*warp_size + threadIdx.x;
 
                 tile_y[l] = by0[l];
@@ -1052,7 +1079,7 @@ static __global__ void mul_mat_q(
             __syncthreads();
         }
 
-        offset_y   += (col_low + jt*J)*(sizeof(block_q8_1_mmq)/sizeof(int));
+        offset_y   += (col_low + jt*J)*(mmq_get_y_block_size<type>() / sizeof(int));
         offset_dst += it*I;
         const float * y_scale_tile = nullptr;
         if constexpr (type == GGML_TYPE_NVFP4) {
@@ -1146,7 +1173,7 @@ static __global__ void mul_mat_q(
             __syncthreads();
         }
 
-        offset_y += (col_low + jt * J) * (sizeof(block_q8_1_mmq) / sizeof(int));
+        offset_y += (col_low + jt * J) * (mmq_get_y_block_size<type>() / sizeof(int));
         offset_dst += it*I;
         const float * y_scale_tile = nullptr;
         if constexpr (type == GGML_TYPE_NVFP4) {
@@ -1230,7 +1257,7 @@ static __global__ void mul_mat_q(
         __syncthreads();
     }
 
-    offset_y += (col_low + jt * J) * (sizeof(block_q8_1_mmq) / sizeof(int));
+    offset_y += (col_low + jt * J) * (mmq_get_y_block_size<type>() / sizeof(int));
     offset_dst += it*I;
     const float * y_scale_tile = nullptr;
     if constexpr (type == GGML_TYPE_NVFP4) {
@@ -1400,7 +1427,7 @@ struct mmq_args {
 static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const int cc) {
     const size_t nbs_ids = config.J*sizeof(int);
     const size_t nbs_x = ggml_cuda_mmq_get_nbytes_shared_x(config, cc);
-    const size_t nbs_y = config.J * (sizeof(block_q8_1_mmq));
+    const size_t nbs_y = config.J * (mmq_use_q4_0_dp8(config.type, cc) ? sizeof(block_q4_0_mmq_dp8) : sizeof(block_q8_1_mmq));
     return nbs_ids + nbs_x + GGML_PAD(nbs_y, config.nthreads*sizeof(int));
 }
 
