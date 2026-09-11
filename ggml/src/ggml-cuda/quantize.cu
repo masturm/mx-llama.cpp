@@ -542,10 +542,10 @@ static __global__ void quantize_mmq_q8_1(
     }
     char4 q;
     if constexpr (q4_0) {
-        q.x = max(-8, min(7, (int) roundf(xi.x*d_inv + 8.5f) - 8));
-        q.y = max(-8, min(7, (int) roundf(xi.y*d_inv + 8.5f) - 8));
-        q.z = max(-8, min(7, (int) roundf(xi.z*d_inv + 8.5f) - 8));
-        q.w = max(-8, min(7, (int) roundf(xi.w*d_inv + 8.5f) - 8));
+        q.x = max(-8, min(7, (int) truncf(xi.x*d_inv + 8.5f) - 8));
+        q.y = max(-8, min(7, (int) truncf(xi.y*d_inv + 8.5f) - 8));
+        q.z = max(-8, min(7, (int) truncf(xi.z*d_inv + 8.5f) - 8));
+        q.w = max(-8, min(7, (int) truncf(xi.w*d_inv + 8.5f) - 8));
     } else {
         q.x = roundf(xi.x*d_inv);
         q.y = roundf(xi.y*d_inv);
@@ -553,6 +553,16 @@ static __global__ void quantize_mmq_q8_1(
         q.w = roundf(xi.w*d_inv);
     }
     const float d = d_inv == 0.0f ? 0.0f : 1.0f / d_inv;
+
+    [[maybe_unused]] uint32_t q4;
+    [[maybe_unused]] uint32_t q4_peer;
+    if constexpr (q4_0){
+        q4 = static_cast<uint8_t>(q.x) | 
+            static_cast<uint32_t>((static_cast<uint8_t>(q.y)) << 8) | 
+            static_cast<uint32_t>((static_cast<uint8_t>(q.z)) << 16) | 
+            static_cast<uint32_t>((static_cast<uint8_t>(q.w)) << 24);
+        q4_peer = __shfl_xor_sync(0xFFFFFFFF, q4, vals_per_scale/8, WARP_SIZE);
+    }
 
     // write the block once (normal) or to each of the token's compact rows (scatter)
     const int nwrite = scatter ? n_expert_used : 1;
@@ -576,7 +586,7 @@ static __global__ void quantize_mmq_q8_1(
 
             if(iqs % vals_per_scale < vals_per_scale/2) {
                 int * yqs = y4[ib].qs;
-                yqs[(iqs/vals_per_scale)*(vals_per_scale/8) + (iqs % (vals_per_scale/4))] = ggml_cuda_pack_i4x8((int) q4, (int) q4_peer);
+                yqs[(iqs/vals_per_scale)*(vals_per_scale/8) + (iqs % vals_per_scale)/4] = ggml_cuda_pack_i4x8((int) q4, (int) q4_peer);
             }
         } else {
             // Write back 4 int8 values as a single 32 bit value for better memory bandwidth:

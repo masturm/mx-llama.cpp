@@ -80,35 +80,15 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 #pragma unroll
             for (int i0 = 0; i0 < I; i0 += warp_size) {
                 const int i = i0 + threadIdx.x;
-                const int kyqs = QI8_1 * ((k01/2) / (QI8_1/2)) + (k01/2) % (QI8_1/2);
-                int u[2*VDR_Q4_0_Q8_1_MMQ];
-
-                constexpr int max_cpy = ggml_cuda_get_max_cpy_bytes();
-                constexpr int mcpy_int = max_cpy / sizeof(int);
-                int tmp0[4], tmp1[4];
-
-#pragma unroll
-                for (int l0 = 0; l0 < 4 / mcpy_int; ++l0) {
-                    ggml_cuda_memcpy_1<max_cpy>(tmp0 + l0 * mcpy_int, &y_qs[j*MMQ_TILE_Y_K + kyqs + l0 * mcpy_int]);
-                    ggml_cuda_memcpy_1<max_cpy>(tmp1 + l0 * mcpy_int, &y_qs[j*MMQ_TILE_Y_K + kyqs + QI4_0 + l0 * mcpy_int]);
-                }
-
-                u[0] = ggml_cuda_pack_i4x8(tmp0[0], tmp1[0]);
-                u[1] = ggml_cuda_pack_i4x8(tmp0[1], tmp1[1]);
-                u[2] = ggml_cuda_pack_i4x8(tmp0[2], tmp1[2]);
-                u[3] = ggml_cuda_pack_i4x8(tmp0[3], tmp1[3]);
+                const int * u =y_qs + j * MMQ_TILE_Y_DP8_K + k01/2;
 
                 int sumi = 0;
 #pragma unroll
                 for (int l0 = 0; l0 < VDR_Q4_0_Q8_1_MMQ; ++l0) {
-                    const int v = x_qs[i*(MMQ_TILE_NE_K + 1) + k0/QR4_0 + l0];
-                    const int vi0 = v & 0x0F0F0F0F;
-                    const int vi1 = (v >> 4) & 0x0F0F0F0F;
-                    const int vi = ggml_cuda_pack_i4x8(vi0 ^ 0x08080808, vi1 ^ 0x08080808);
-                    sumi = ggml_cuda_dp8_i4(vi, u[l0], sumi);
+                    sumi = ggml_cuda_dp8_i4(x_qs[i*(MMQ_TILE_NE_K + 1) + k0/QR4_0 + l0], u[l0], sumi);
                 }
 
-                const float2 ds8f = __half22float2(y_ds[j*MMQ_TILE_Y_K + k01/QI8_1]);
+                const float2 ds8f = __half22float2(y_ds[j*MMQ_TILE_Y_DP8_K + k01/QI8_1]);
                 sum[j0/nwarps*I/warp_size + i0/warp_size] += x_df[i*(MMQ_TILE_NE_K/QI4_0) + i/QI4_0 + k0/(QR4_0*QI4_0)] * sumi * ds8f.x;
             }
         }

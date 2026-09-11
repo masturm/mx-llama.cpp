@@ -147,6 +147,9 @@ degradation is consistent with the intended lower precision of the activation
 quantizer. The catastrophic `110748` PPL was caused by the packing bug and is
 superseded by this result.
 
+For reference "Qwen3.5-9B-UD-IQ2_XXS.gguf" gives below 
+Final estimate: PPL = 4.6741 +/- 0.24987
+
 ## Next Steps
 
 1. Build a second DP4 directory with the macro disabled.
