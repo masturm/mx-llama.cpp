@@ -49,11 +49,34 @@ Modified files:
   - Converts Q4_0 weight nibbles from unsigned `0..15` to signed `-8..7`.
 - `ggml/src/ggml-cuda/mmq.cuh`
   - Selects the dot8 Q4_0 helper when the experiment macro is enabled.
+  - Changed from compile-time `__gfx906__` guard to runtime check for `GGML_CUDA_CC_VEGA20` to fix issue where wrong quantizer was called.
 - `ggml/src/ggml-cuda/quantize.cu`
   - Adds Q4_0-specific symmetric int4 activation quantization.
   - Uses the Q4_0 scale convention with `d = amax / 8`.
+  - Changed from compile-time `__gfx906__` guard to runtime check for `GGML_CUDA_CC_VEGA20` to fix issue where wrong quantizer was called.
+  - Fixed uninitialized `sum` in `quantize_mmq_q8_1`.
 
 The normal Q8 activation path remains available when the macro is disabled.
+
+******
+Work in progress performance optimization:
+- `ggml/src/ggml-cuda/common.cuh`
+  - Adds the gfx906 `V_DOT8_I32_I4` helper.
+  - Supports `GGML_CUDA_Q4_0_INT4_SCALAR_REFERENCE`, which replaces the hardware instruction with an independent scalar signed-int4 dot for validation.
+- `ggml/src/ggml-cuda/mmq-vec-dot.cuh`
+  - Adds the Q4_0/int4 activation dot8 path.
+  - Reads prepaclkd signed int4 operands for the dot8 instruction.
+- `ggml/src/ggml-cuda/mmq-load-tiles.cuh`
+  - Converts Q4_0 weight nibbles from unsigned `0..15` to signed `-8..7`. while loading the X tile.
+- `ggml/src/ggml-cuda/mmq.cuh`
+  - Selects the dot8 Q4_0 helper when the experiment macro is enabled.
+  - Defines the 80-byte packed Q4_0 activation block used by the DP8 path
+-`ggml/src/ggml-cuda/mmq.cu`
+  - Allocates and strides the compact Q4_0 activation wrokspace separately from from Q8_1
+- `ggml/src/ggml-cuda/quantize.cu`
+  - Adds Q4_0-specific symmetric int4 activation quantization.
+  - Uses the Q4_0 signed-maiximum scale convention with `d = max_value / -8`.
+  - Packs activation nibbles into dot8 operands while quantizing
 
 ## Performance
 
@@ -79,6 +102,12 @@ Corrected Q4_0 DP8 path:
 
 ```text
 482.59 t/s, pp4096
+```
+
+Fixed DP8 path (after fixing wrong quantizer issue):
+
+```text
+1068.90 PP @ 225W (~7% better than baseline)
 ```
 
 The first implementation is approximately 41% slower than the original Q4_0 path. The current dot8 helper still performs packing and nibble rearrangement inside the matmul loop, so this is not yet an optimized implementation.
