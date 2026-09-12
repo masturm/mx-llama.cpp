@@ -70,6 +70,10 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     const int * y_qs = (const int *) y + 4;
     const half2 * y_ds = (const half2 *) y;
 
+    // Unroll k01 by 2 (4 iterations total): fewer address computations per dot8 and more
+    // LDS/dot8 overlap. Do not go to a full unroll - it hits the 128 VGPR cap and spills
+    // to scratch, which roughly halves prefill throughput.
+#pragma unroll 2
     for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QR4_0*VDR_Q4_0_Q8_1_MMQ) {
         const int k0 = k00 + k01;
 
