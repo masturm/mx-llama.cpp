@@ -23,6 +23,14 @@ static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_conf
         return ggml_cuda_mmq_config(
             GGML_TYPE_Q8_0, 512, 2, 128, J, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, fallback);
     }
+    // Q4_0: same 8-warp / wide-tile treatment as Q8_0. On gfx906 the Q4_0 dot runs
+    // through the dp8 path, so more warps and wider tiles hide LDS/VMEM latency the
+    // same way. The sram check and the J>64 occupancy gate in mul_mat_q_switch_J cap
+    // J where it would not keep the CUs busy.
+    if (type == GGML_TYPE_Q4_0 && J >= 8 && J <= 128 && (J % 8) == 0) {
+        return ggml_cuda_mmq_config(
+            GGML_TYPE_Q4_0, 512, 2, 128, J, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, fallback);
+    }
     if (J >= 8 && J <= 128 && (J % 8) == 0) {
         switch (type) {
             case GGML_TYPE_IQ1_S:

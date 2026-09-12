@@ -38,7 +38,7 @@ The active build is configured for `gfx906` with `GGML_CUDA_Q4_0_INT4_ACTIVATION
 
 ## Code Changes
 
-Modified files:
+Modified files (outdated for reference): 
 
 - `ggml/src/ggml-cuda/common.cuh`
   - Adds the gfx906 `V_DOT8_I32_I4` helper.
@@ -59,7 +59,7 @@ Modified files:
 The normal Q8 activation path remains available when the macro is disabled.
 
 ******
-Work in progress performance optimization:
+Current State: Work in progress performance optimization NOW works good perplexity PP 1066tok/s ca. 7% more than the baseline :
 - `ggml/src/ggml-cuda/common.cuh`
   - Adds the gfx906 `V_DOT8_I32_I4` helper.
   - Supports `GGML_CUDA_Q4_0_INT4_SCALAR_REFERENCE`, which replaces the hardware instruction with an independent scalar signed-int4 dot for validation.
