@@ -84,13 +84,14 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 #pragma unroll
             for (int i0 = 0; i0 < I; i0 += warp_size) {
                 const int i = i0 + threadIdx.x;
-                const int * u =y_qs + j * MMQ_TILE_Y_DP8_K + k01/2;
+                // y row is 20 ints (80B) and 16B-aligned, so load the 4 y operands as one 16B read
+                const int4 u4 = *(const int4 *)(y_qs + j * MMQ_TILE_Y_DP8_K + k01/2);
 
                 int sumi = 0;
-#pragma unroll
-                for (int l0 = 0; l0 < VDR_Q4_0_Q8_1_MMQ; ++l0) {
-                    sumi = ggml_cuda_dp8_i4(x_qs[i*(MMQ_TILE_NE_K + 1) + k0/QR4_0 + l0], u[l0], sumi);
-                }
+                sumi = ggml_cuda_dp8_i4(x_qs[i*(MMQ_TILE_NE_K + 1) + k0/QR4_0 + 0], u4.x, sumi);
+                sumi = ggml_cuda_dp8_i4(x_qs[i*(MMQ_TILE_NE_K + 1) + k0/QR4_0 + 1], u4.y, sumi);
+                sumi = ggml_cuda_dp8_i4(x_qs[i*(MMQ_TILE_NE_K + 1) + k0/QR4_0 + 2], u4.z, sumi);
+                sumi = ggml_cuda_dp8_i4(x_qs[i*(MMQ_TILE_NE_K + 1) + k0/QR4_0 + 3], u4.w, sumi);
 
                 const float2 ds8f = __half22float2(y_ds[j*MMQ_TILE_Y_DP8_K + k01/QI8_1]);
                 sum[j0/nwarps*I/warp_size + i0/warp_size] += x_df[i*(MMQ_TILE_NE_K/QI4_0) + i/QI4_0 + k0/(QR4_0*QI4_0)] * sumi * ds8f.x;
