@@ -1204,6 +1204,7 @@ struct llama_model_deepseek4 : public llama_model_base {
         // V4.1 ships none and reuses the mix the last layer already computed.
         // This runs from the base constructor, where a virtual call cannot reach a derived override, so the fold keys off whether the head tensors are present.
         mutable ggml_tensor * last_ffn_pre = nullptr;
+        mutable std::vector<ggml_tensor *> engram_host_emb;
 
         ggml_tensor * build_head_fold(const llama_model & model, ggml_tensor * x) const;
 
