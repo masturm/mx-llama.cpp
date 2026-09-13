@@ -762,7 +762,7 @@ static __device__ __forceinline__ int ggml_cuda_pack_i4x8(const int a, const int
         ((ub & 0x000F0000) << 8) | ((ub & 0x0F000000) << 4);
 }
 
-#if defined(GGML_CUDA_Q4_0_INT4_ACTIVATIONS) && defined(__gfx906__)
+#if defined(GGML_CUDA_Q4_0_INT4_ACTIVATIONS) && (defined(__gfx906__) || defined(RDNA2))
 static __device__ __forceinline__ int ggml_cuda_dp8_i4(const int a, const int b, int c) {
 #if defined(GGML_CUDA_Q4_0_INT4_SCALAR_REFERENCE)
     for (int i = 0; i < 8; ++i) {

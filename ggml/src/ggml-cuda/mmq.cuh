@@ -66,7 +66,7 @@ static_assert(sizeof(block_q4_0_mmq_dp8)  == QK8_1_MMQ/2 + 4* sizeof(half2),    
 
 static constexpr __host__ __device__ bool mmq_use_q4_0_dp8(const ggml_type type, const int cc) {
 #if defined(GGML_CUDA_Q4_0_INT4_ACTIVATIONS)
-    return type == GGML_TYPE_Q4_0 && cc == GGML_CUDA_CC_VEGA20;
+    return type == GGML_TYPE_Q4_0 && (cc == GGML_CUDA_CC_VEGA20 || GGML_CUDA_CC_IS_RDNA2(cc));
 #else
     GGML_UNUSED(type);
     GGML_UNUSED(cc);
@@ -75,7 +75,7 @@ static constexpr __host__ __device__ bool mmq_use_q4_0_dp8(const ggml_type type,
 }
 
 template <ggml_type type> static constexpr __device__ int mmq_get_y_block_size() {
-#if defined(GGML_CUDA_Q4_0_INT4_ACTIVATIONS) && defined(__gfx906__)
+#if defined(GGML_CUDA_Q4_0_INT4_ACTIVATIONS) && (defined(__gfx906__) || defined(RDNA2))
     return type == GGML_TYPE_Q4_0 ? sizeof(block_q4_0_mmq_dp8) : sizeof(block_q8_1_mmq);
 #else
     return sizeof(block_q8_1_mmq);
@@ -589,7 +589,7 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
                     ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a<type, J, fallback>,
                     ggml_cuda_mmq_write_back_dp4a<type, J, fallback>);
             case GGML_TYPE_Q4_0:
-#if defined(GGML_CUDA_Q4_0_INT4_ACTIVATIONS) && defined(__gfx906__)
+#if defined(GGML_CUDA_Q4_0_INT4_ACTIVATIONS) && (defined(__gfx906__) || defined(RDNA2))
                 return ggml_cuda_mmq_util_funcs(
                     VDR_Q4_0_Q8_1_MMQ,
                     ggml_cuda_mmq_load_tiles_q4_0<type, J, fallback>,
