@@ -336,8 +336,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_inp_engram(const llama_model &
     }();
     engram_host_emb.clear();
     if (n_threads > 0) {
-        if (model.split_mode() != LLAMA_SPLIT_MODE_LAYER) {
-            throw std::runtime_error("Experimental host Engram inputs require layer split");
+        if (model.split_mode() != LLAMA_SPLIT_MODE_LAYER && model.split_mode() != LLAMA_SPLIT_MODE_TENSOR) {
+            throw std::runtime_error("Experimental host Engram inputs require layer or tensor split");
         }
         inp->n_threads = n_threads;
         for (int64_t e = 0; e < n_eng; ++e) {
