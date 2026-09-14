@@ -29,7 +29,6 @@ cmake --build build --config Release -j
 Recommended environment (each variable enables one of the features above):
 
 ```bash
-export GGML_ENABLE_CUSTOM_AR=1      # custom multi-GPU AllReduce
 export HSA_FORCE_FINE_GRAIN_PCIE=1  # peer-write AllReduce fast path (AMD over PCIe, validated gfx906)
 export GPU_MAX_HW_QUEUES=8          # MoE throughput on -tps
 export LLAMA_ENABLE_MTP_OPT=1       # MTP optimizations (with --spec-type draft-mtp)
@@ -73,7 +72,7 @@ requires `n_gpus % T == 0`. Backend-generic.
 An optional peer-write broadcast plus two-shot reduce-scatter / allgather
 AllReduce for the tensor-parallel reduction (in addition to upstream's
 `allreduce.cu`). F32 on the wire and faster than the RCCL / NCCL ring for token
-generation over PCIe. Enable with `GGML_ENABLE_CUSTOM_AR=1`; the fast peer-write
+generation over PCIe. On by default, `GGML_ENABLE_CUSTOM_AR=0` turns it off; the fast peer-write
 path needs fine-grain PCIe coherence (`HSA_FORCE_FINE_GRAIN_PCIE=1` on any AMD
 over PCIe, a no-op on hardware-coherent GPUs and ignored on NVIDIA). Decode-size
 collectives automatically use two-shot for TP5, TP8, TP10, and TP4 pipeline
