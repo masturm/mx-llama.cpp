@@ -988,8 +988,9 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
 
     // the pooled compressor serves V4's plain tier, and both of V4.1's
     const bool pooled   = (v41 ? owns_kv : tier_plain) && !(v41 && compress_off);
+    const llm_graph_input_dsv4::comp_input no_tier = {};
     const auto & tier   = inp_dsv4 ? (v41 && tier_idx ? inp_dsv4->get_csa() : inp_dsv4->get_hca())
-                                   : inp_dsv4->get_hca();
+                                   : no_tier;
     const int64_t tier_ratio = ratio;
 
     ggml_tensor * hca_state_kv    = nullptr;
