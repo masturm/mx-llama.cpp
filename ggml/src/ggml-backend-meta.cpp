@@ -2401,6 +2401,22 @@ struct ggml_backend_meta_lane_dispatcher {
     }
 };
 
+// An ordinary split that continues a graph after a split on another backend starts on the stage the previous meta split of that graph ended on, as callback fragments already do.
+// Stage 0 only holds a stale copy of what that split left on its last stage, and DeepSeek-V4.1 hits this at every Engram gather, which runs on the host between two meta splits.
+// The scheduler resets the stage at the start of every graph through ggml_backend_meta_graph_begin.
+// GGML_META_SPLIT_CARRY_STAGE=0 restores the old start on stage 0.
+static bool ggml_backend_meta_carry_stage() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_META_SPLIT_CARRY_STAGE");
+        const bool v = e == nullptr || atoi(e) != 0;
+        if (!v) {
+            GGML_LOG_WARN("%s: GGML_META_SPLIT_CARRY_STAGE=0, every split starts on stage 0\n", __func__);
+        }
+        return v;
+    }();
+    return on;
+}
+
 struct ggml_backend_meta_context {
     struct cgraph_config {
         ggml_cgraph * cgraph_main = nullptr;
@@ -3704,8 +3720,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
 
             int i_start = 0;
-            // Fragments inherit the active stage from the previous fragment.
-            int current_stage = fragment ? backend_ctx->frag_last_stage : 0;
+            // Fragments inherit the active stage from the previous fragment, and with the carried stage so does an ordinary split that follows a split on another backend.
+            const bool carry_stage = ggml_backend_meta_carry_stage();
+            int current_stage = (fragment || carry_stage) ? backend_ctx->frag_last_stage : 0;
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (node->buffer == nullptr || !ggml_backend_buffer_is_meta(node->buffer)) {
@@ -3986,6 +4003,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
             GGML_ASSERT(i_start == cgraph->n_nodes);
 
+            if (carry_stage && !fragment) {
+                backend_ctx->frag_last_stage = current_stage;
+            }
             if (fragment) {
                 backend_ctx->frag_last_stage = current_stage;
                 for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -4937,6 +4957,15 @@ size_t ggml_backend_meta_n_stages(ggml_backend_t meta_backend) {
     GGML_ASSERT(ggml_backend_is_meta(meta_backend));
     const ggml_backend_meta_context * backend_ctx = (const ggml_backend_meta_context *) meta_backend->context;
     return backend_ctx->n_stages;
+}
+
+void ggml_backend_meta_graph_begin(ggml_backend_t meta_backend) {
+    GGML_ASSERT(ggml_backend_is_meta(meta_backend));
+    // A new graph begins on stage 0, only the splits that follow inside it carry the stage.
+    if (ggml_backend_meta_carry_stage()) {
+        ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) meta_backend->context;
+        backend_ctx->frag_last_stage = 0;
+    }
 }
 
 ggml_backend_t ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, size_t index) {

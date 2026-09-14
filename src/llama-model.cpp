@@ -428,7 +428,10 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     const llama_meta_device_get_split_state_userdata * ud = (const llama_meta_device_get_split_state_userdata *) userdata;
     const llama_hparams & hparams = ud->model->hparams;
     const std::string tensor_name = tensor->name;
+    // V4.1 shares V4's grouped attention output, so every rule that sizes a per-head or per-group segment by dsv4_o_group_count applies to it as well.
+    // Left out, the attention sinks fell to the generic per-head granularity, which put all 64 of a layer's sink values on one lane while the attention node held 32 heads per lane.
     const bool is_dsv4 = ud->model->arch == LLM_ARCH_DEEPSEEK4 ||
+        ud->model->arch == LLM_ARCH_DEEPSEEK41 ||
         (ud->model->arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0);
 
     static const std::regex pattern_q_weight        ("blk\\.\\d*\\.attn_q.weight");
@@ -595,8 +598,12 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     // up-projection that needs its own head-split rule. Add both before widening this.
     // A DSV4-backbone DFlash drafter carries the same grouped-LoRA output and the same
     // single-head KV latent, so it takes the identical routing.
+    // V4.1 carries the same attention shape this path was written for: a grouped-LoRA output projection over o_groups and a single-head KV latent.
+    // Its compressor and indexer are separate tensors with their own rules, and the compressed latent stays mirrored, so each device scores its own heads against the whole of it.
+    // Left out of the gate, V4.1 fell through to the design-A mirror and kept a full copy of attn_q_b, attn_output_a and attn_output_b on every device, 4.65 GiB per card of the 5.70 GiB that overflowed them.
     const bool head_split_attention = mla_tp_env && replicate_attention &&
-                                      (ud->model->arch == LLM_ARCH_DEEPSEEK4 || dflash_dsv4_split);
+                                      (ud->model->arch == LLM_ARCH_DEEPSEEK4 ||
+                                       ud->model->arch == LLM_ARCH_DEEPSEEK41 || dflash_dsv4_split);
     if (mla_tp_env && replicate_attention && !head_split_attention) {
         LLAMA_LOG_WARN("%s: LLAMA_MLA_TP is only implemented for deepseek4, using design A\n", __func__);
     }
