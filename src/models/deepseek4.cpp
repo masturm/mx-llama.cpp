@@ -941,7 +941,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
         const char * e = getenv("LLAMA_DSV41_QNORM");
         return !(e != nullptr && atoi(e) != 0);
     }();
-    if (!(hparams.dsv41_n_kv_source > 0 && q_norm_off)) {
+    const bool dspark_v41 = inp_mtp && model.arch == LLM_ARCH_DFLASH && model.dspark_markov_w1 && model.hc_head_fn == nullptr;
+    if (!(hparams.dsv41_n_kv_source > 0 && q_norm_off) && !dspark_v41) {
         q = ggml_rms_norm(ctx0, q, norm_rms_eps);
     }
     cb(q, "q_norm", il);
