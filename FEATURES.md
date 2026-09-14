@@ -177,8 +177,7 @@ A 16965-token prompt takes about 678 thousand major faults and 63 GB of reads on
 
 Three diagnostic env gates ship with the support, all default off and each logging once when engaged: `LLAMA_DSV41_NO_ENGRAM` drops the Engram contribution, `LLAMA_DSV41_NO_COMPRESS` drops the compressed tier, and `LLAMA_DSV41_QNORM` restores the V4 query norm.
 
-Scope: `-sm layer` only.
-`-sm tensor` loads and runs but does not reproduce its own output, so it carries no claim here.
+Scope: `-sm layer`, and `-sm tensor -tps 2` since the incremental stage transfer for persistent caches, which reproduces its own output and beats layer mode on decode.
 Speculative decoding against a V4.1 DSpark sidecar is not supported yet.
 
 ## Qwen3.8-Flash-Next tensor parallelism
@@ -295,6 +294,22 @@ byte-identical in every arm:
 
 Hardware-queue handling (`GPU_MAX_HW_QUEUES`) and an optional RCCL point-to-point
 stage-transfer path (`GGML_META_XFER_RCCL`) for the multi-stage pipeline.
+
+## Incremental stage transfer for persistent caches
+
+A multi-stage `-sm tensor` pipeline hands every mirrored tensor a later stage reads across the stage boundary.
+When the reader is a view of a persistent cache, the boundary tensor used to be the writer's set_rows output, which is the whole cache view, so each hop copied the full cache on every token, and each reading layer's own view of a shared cache added one more full copy.
+DeepSeek-V4.1 layers after a source layer read the source layer's caches, and on ten MI50 at `-tps 2` the stage 3 hop moved about 244 MB per token, which is where tensor decode lost to layer mode and why the prefill pipeline never filled.
+The meta backend now keeps a host copy of the small integer inputs it is handed (the KV cell indices) and transfers a set_rows boundary as the dense cell range those indices name, a row block of each lane's own cache, exact bytes.
+A pure view of a persistent cache is served by the cache's writer once instead of one full copy per reading layer.
+Sparse or unknown indices fall back to the full copy, and `GGML_META_XFER_ROWS=0` restores the previous transfers.
+Measured on ten MI50 with a 16965-token prompt at temperature 0, Engram off, `-sm tensor -tps 2`, with the greedy top-5 records bit-identical across three requests and two boots:
+
+```
+prefill  214 -> 601 t/s     decode  7.2 -> 21.5 t/s     (-sm layer on the same prompt: 600 to 650 and 14.1)
+```
+
+Only multi-stage tensor splits go through this path, layer mode and single-stage splits do not run it, and a model whose layers read only their own caches moves nothing new.
 
 ## gfx906 kernel tuning
 
