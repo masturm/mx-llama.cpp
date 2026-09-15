@@ -992,6 +992,14 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
 
     void * dev_ptr;
     cudaError_t err = ggml_cuda_device_malloc(&dev_ptr, size, buft_ctx->device);
+    if (err == cudaErrorMemoryAllocation && ggml_cuda_repack_try_release_scratch(buft_ctx->device)) {
+        // The repack upload scratch outlives the load until the first compute, so a compute reserve can find it still resident.
+        (void)cudaGetLastError();
+        err = ggml_cuda_device_malloc(&dev_ptr, size, buft_ctx->device);
+        if (err == cudaSuccess) {
+            GGML_LOG_DEBUG("%s: allocation of %.2f MiB on device %d fit after releasing the repack upload scratch\n", __func__, size / 1024.0 / 1024.0, buft_ctx->device);
+        }
+    }
     if (err != cudaSuccess) {
         // clear the error
         (void)cudaGetLastError();
