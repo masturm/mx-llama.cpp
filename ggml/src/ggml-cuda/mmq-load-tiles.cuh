@@ -250,6 +250,89 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     }
 }
 
+#if defined(GGML_CUDA_Q4_0_DP8_PIPELINE) && defined(GGML_CUDA_Q4_0_INT4_ACTIVATIONS) && (defined(__gfx906__) || defined(RDNA2))
+
+// SW pipeline: split the Q4_0 dp8 tile load into a global->register prefetch and a
+// register->LDS store so the next kb0 slab loads while the current one computes.
+// The repack conversion moves into the store. Single-buffered LDS.
+
+template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_prefetch_x_q4_0_dp8(
+        const char * __restrict__ x, int * x_qs_r, float * x_d_r, const int kbx0, const int i_max, const int stride) {
+    constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
+    constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
+
+    constexpr int threads_per_row = MMQ_ITER_K / (4 * QR4_0);
+    constexpr int nrows = warp_size / threads_per_row;
+    const int txi = warp_size > threads_per_row ? threadIdx.x % threads_per_row : threadIdx.x;
+    const int kbx  = txi / QI4_0;
+    const int kqsx = txi % QI4_0;
+
+#pragma unroll
+    for (int i0 = 0, r = 0; i0 < I; i0 += nrows*nwarps, ++r) {
+        int i = i0 + (nrows == 1 ? threadIdx.y : threadIdx.y*nrows + threadIdx.x/threads_per_row);
+
+        if (fallback) {
+            i = min(i, i_max);
+        }
+
+        const block_q4_0 * bxi = (const block_q4_0 *) x + kbx0 + i*stride + kbx;
+        // 4B word pair (8 values); get_int_b2 would be two 2B loads = 2x the registers
+        x_qs_r[r] = ((const int *) bxi->qs)[kqsx];
+    }
+
+    constexpr int blocks_per_tile_x_row = MMQ_TILE_NE_K / QI4_0;
+    constexpr int rows_per_warp = warp_size / blocks_per_tile_x_row;
+    const int kbxd = threadIdx.x % blocks_per_tile_x_row;
+
+#pragma unroll
+    for (int i0 = 0, r = 0; i0 < I; i0 += nwarps * rows_per_warp, ++r) {
+        int i = i0 + threadIdx.y * rows_per_warp + threadIdx.x / blocks_per_tile_x_row;
+
+        if (fallback) {
+            i = min(i, i_max);
+        }
+
+        const block_q4_0 * bxi = (const block_q4_0 *) x + kbx0 + i*stride + kbxd;
+        x_d_r[r] = bxi->d;
+    }
+}
+
+template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_store_x_q4_0_dp8(
+        const int * x_qs_r, const float * x_d_r, int * __restrict__ x_tile) {
+    constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
+    constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
+
+    constexpr int threads_per_row = MMQ_ITER_K / (4 * QR4_0);
+    constexpr int nrows = warp_size / threads_per_row;
+    const int txi = warp_size > threads_per_row ? threadIdx.x % threads_per_row : threadIdx.x;
+
+    constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_Q4_0, I);
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_qs + txs.qs);
+
+#pragma unroll
+    for (int i0 = 0, r = 0; i0 < I; i0 += nrows*nwarps, ++r) {
+        const int i = i0 + (nrows == 1 ? threadIdx.y : threadIdx.y*nrows + threadIdx.x/threads_per_row);
+        const int qs0 = x_qs_r[r];
+        x_qs[i*(MMQ_TILE_NE_K + 1) + txi] = ggml_cuda_pack_i4x8(
+            (qs0 & 0x0F0F0F0F) ^ 0x08080808, ((qs0 >> 4) & 0x0F0F0F0F) ^ 0x08080808);
+    }
+
+    constexpr int blocks_per_tile_x_row = MMQ_TILE_NE_K / QI4_0;
+    constexpr int rows_per_warp = warp_size / blocks_per_tile_x_row;
+    const int kbxd = threadIdx.x % blocks_per_tile_x_row;
+
+#pragma unroll
+    for (int i0 = 0, r = 0; i0 < I; i0 += nwarps * rows_per_warp, ++r) {
+        const int i = i0 + threadIdx.y * rows_per_warp + threadIdx.x / blocks_per_tile_x_row;
+        x_df[i*(MMQ_TILE_NE_K/QI4_0) + i/QI4_0 + kbxd] = x_d_r[r];
+    }
+}
+
+#endif // defined(GGML_CUDA_Q4_0_DP8_PIPELINE)
+
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_q4_1(
         const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
     constexpr int warp_size   = ggml_cuda_get_physical_warp_size();

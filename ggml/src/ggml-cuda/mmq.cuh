@@ -945,39 +945,109 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
     constexpr int sz =  mmq_get_y_block_size<type>() / sizeof(int);
 
-    for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
-        load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
-        {
+#if defined(GGML_CUDA_Q4_0_DP8_PIPELINE) && defined(GGML_CUDA_Q4_0_INT4_ACTIVATIONS) && (defined(__gfx906__) || defined(RDNA2))
+    if constexpr (type == GGML_TYPE_Q4_0 && J == 32) {
+        // SW pipeline: the next kb0 slab is prefetched into registers while the
+        // current one computes. J=32 is the only width that fits: the prefetch slab
+        // (x: 16 qs word pairs + 4 d, y: 3+3 slots) adds ~26 VGPR on top of the
+        // 167 of the J=32 kernel, the J=64 kernel at 254 would spill.
+        constexpr int nqs = I / ((warp_size / (MMQ_ITER_K / (4 * QR4_0))) * nwarps);
+        constexpr int nd  = I / (nwarps * (warp_size / (MMQ_TILE_NE_K / QI4_0)));
+        constexpr int ny  = (J * tile_y_k + nwarps * warp_size - 1) / (nwarps * warp_size);
+
+        int   x_qs_r[nqs];
+        float x_d_r[nd];
+        int   y_r1[ny];
+        int   y_r2[ny];
+
+        const int l = threadIdx.y*warp_size + threadIdx.x;
+
+        auto prefetch = [&](int kb0) {
+            ggml_cuda_mmq_prefetch_x_q4_0_dp8<type, J, fallback>(x, x_qs_r, x_d_r, offset_x + kb0, tile_x_max_i, stride_row_x);
             const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
+            const int * by1 = by0 + ncols_y * sz;
 #pragma unroll
             for (int l0 = 0; l0 < J * tile_y_k; l0 += nwarps * warp_size) {
-                int l = l0 + threadIdx.y*warp_size + threadIdx.x;
-
-                tile_y[l] = by0[l];
+                const int li = l0 + l;
+                if (li < J * tile_y_k) {
+                    y_r1[l0 / (nwarps * warp_size)] = by0[li];
+                    y_r2[l0 / (nwarps * warp_size)] = by1[li];
+                }
             }
-        }
+        };
 
-        __syncthreads();
-
-        vec_dot(tile_x, tile_y, sum, 0);
-
-        __syncthreads();
-
-        {
-            const int * by0 = y + ncols_y * ((kb0 * qk / ne_block) * sz + sz);
+        auto store_y_half = [&](int h) {
 #pragma unroll
             for (int l0 = 0; l0 < J * tile_y_k; l0 += nwarps * warp_size) {
-                int l = l0 + threadIdx.y*warp_size + threadIdx.x;
-
-                tile_y[l] = by0[l];
+                const int li = l0 + l;
+                if (li < J * tile_y_k) {
+                    tile_y[li] = (h == 0 ? y_r1 : y_r2)[l0 / (nwarps * warp_size)];
+                }
             }
+        };
+
+        prefetch(kb0_start);
+
+        for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
+            ggml_cuda_mmq_store_x_q4_0_dp8<type, J, fallback>(x_qs_r, x_d_r, tile_x);
+            store_y_half(0);
+
+            __syncthreads();
+
+            vec_dot(tile_x, tile_y, sum, 0);
+
+            __syncthreads();
+
+            // all register consumers of the current slab are done, the next slab can be loaded
+            store_y_half(1);
+
+            __syncthreads();
+
+            if (kb0 + blocks_per_iter < kb0_stop) {
+                prefetch(kb0 + blocks_per_iter);
+            }
+
+            vec_dot(tile_x, tile_y, sum, MMQ_TILE_NE_K);
+
+            __syncthreads();
         }
+    } else
+#endif
+    {
+        for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
+            load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
+            {
+                const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
+#pragma unroll
+                for (int l0 = 0; l0 < J * tile_y_k; l0 += nwarps * warp_size) {
+                    int l = l0 + threadIdx.y*warp_size + threadIdx.x;
 
-        __syncthreads();
+                    tile_y[l] = by0[l];
+                }
+            }
 
-        vec_dot(tile_x, tile_y, sum, MMQ_TILE_NE_K);
+            __syncthreads();
 
-        __syncthreads();
+            vec_dot(tile_x, tile_y, sum, 0);
+
+            __syncthreads();
+
+            {
+                const int * by0 = y + ncols_y * ((kb0 * qk / ne_block) * sz + sz);
+#pragma unroll
+                for (int l0 = 0; l0 < J * tile_y_k; l0 += nwarps * warp_size) {
+                    int l = l0 + threadIdx.y*warp_size + threadIdx.x;
+
+                    tile_y[l] = by0[l];
+                }
+            }
+
+            __syncthreads();
+
+            vec_dot(tile_x, tile_y, sum, MMQ_TILE_NE_K);
+
+            __syncthreads();
+        }
     }
 
     if (fixup) {
@@ -1522,6 +1592,26 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
 
     int J_best        = 0;
     int ntiles_J_best = INT_MAX;
+
+    // debug: force the tile width, e.g. GGML_CUDA_MMQ_J=32
+    {
+        static const char * e = getenv("GGML_CUDA_MMQ_J");
+        if (e) {
+            const int j = atoi(e);
+            const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, j, fallback, cc);
+            if (j > 0 && j <= 128 && j % 8 == 0 && config.type != GGML_TYPE_COUNT && mmq_get_nbytes_shared(config, cc) <= smpbo) {
+                J_best = j;
+                ntiles_J_best = 1;
+                static bool printed = false;
+                if (!printed) {
+                    fprintf(stderr, "ggml_cuda: MMQ J forced to %d via GGML_CUDA_MMQ_J\n", j);
+                    printed = true;
+                }
+            } else {
+                fprintf(stderr, "ggml_cuda: GGML_CUDA_MMQ_J=%d not available, ignoring\n", j);
+            }
+        }
+    }
 
     for (int J = 8; J <= 128 && ntiles_J_best > 1; J += 8) {
         const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc);
