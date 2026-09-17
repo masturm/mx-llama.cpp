@@ -3826,6 +3826,56 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 max_tmp_size = std::max(max_tmp_size, 2*ggml_nbytes(src));
             }
 
+            // Lowest stage whose lanes all hold every stage-local mirrored weight the node reads.
+            // Returns -1 when nothing constrains the node or when the stage it would inherit already holds them all.
+            auto mirror_owning_stage = [&](const ggml_tensor * node, int preferred) -> int {
+                if (backend_ctx->n_stages <= 1 || is_pure_view_op(node->op)) {
+                    return -1;
+                }
+                const ggml_tensor * masked[GGML_MAX_SRC];
+                size_t n_masked = 0;
+                for (int sx = 0; sx < GGML_MAX_SRC; sx++) {
+                    const ggml_tensor * src = node->src[sx];
+                    while (src != nullptr && src->view_src != nullptr) {
+                        src = src->view_src;
+                    }
+                    if (src == nullptr || src->op != GGML_OP_NONE || src->buffer == nullptr ||
+                            !ggml_backend_buffer_is_meta(src->buffer) ||
+                            ggml_backend_buffer_get_usage(src->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE ||
+                            ggml_backend_meta_get_split_state(src, /*assume_sync =*/ true).axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+                        continue;
+                    }
+                    for (size_t j = 0; j < n_backends; j++) {
+                        if (ggml_backend_meta_mirror_lane_absent(src, j)) {
+                            masked[n_masked++] = src;
+                            break;
+                        }
+                    }
+                }
+                if (n_masked == 0) {
+                    return -1;
+                }
+                auto stage_holds = [&](size_t stage) {
+                    for (size_t k = 0; k < n_masked; k++) {
+                        for (size_t lane = stage*backend_ctx->tps; lane < (stage + 1)*backend_ctx->tps; lane++) {
+                            if (ggml_backend_meta_mirror_lane_absent(masked[k], lane)) {
+                                return false;
+                            }
+                        }
+                    }
+                    return true;
+                };
+                if (preferred >= 0 && stage_holds((size_t) preferred)) {
+                    return -1;
+                }
+                for (size_t s = 0; s < backend_ctx->n_stages; s++) {
+                    if (stage_holds(s)) {
+                        return (int) s;
+                    }
+                }
+                return -1;
+            };
+
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (node->buffer == nullptr || !ggml_backend_buffer_is_meta(node->buffer)) {
@@ -3856,6 +3906,11 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                             n_stage = (int) it_b->second;
                         }
                     }
+                }
+                if (n_stage < 0) {
+                    // Still no owning stage, so the node would inherit the current one.
+                    // A stage-local mirrored weight has copies on some stages only, and the placement above sees split weights alone, so a node reading one follows the weight instead.
+                    n_stage = mirror_owning_stage(node, current_stage);
                 }
                 bool stage_transition = (backend_ctx->n_stages > 1 && n_stage >= 0 && n_stage != current_stage && i > i_start);
                 if (stage_transition) {
