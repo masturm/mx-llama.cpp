@@ -2604,6 +2604,9 @@ struct ggml_backend_meta_context {
     // the barrier bills for them) collapse to one per token. On by default,
     // GGML_META_TOKEN_GRAPH=0 goes back to per-subgraph dispatch.
     bool token_graph = false;
+    // sub-backend entry point that switches off its per-subgraph graph cache
+    void (*graph_cache_disable)(ggml_backend_t) = nullptr;
+    bool inner_graphs_disabled = false;
     bool (*tg_capture_begin)(ggml_backend_t)        = nullptr;
     void * (*tg_capture_end)(ggml_backend_t)        = nullptr;
     void (*tg_graph_launch)(ggml_backend_t, void *) = nullptr;
@@ -2871,6 +2874,8 @@ struct ggml_backend_meta_context {
                     ggml_backend_reg_get_proc_address(simple_reg, "ggml_backend_token_graph_launch");
                 tg_graph_free = (void (*)(ggml_backend_t, void *))
                     ggml_backend_reg_get_proc_address(simple_reg, "ggml_backend_token_graph_free");
+                graph_cache_disable = (void (*)(ggml_backend_t))
+                    ggml_backend_reg_get_proc_address(simple_reg, "ggml_backend_graph_cache_disable");
                 break;
             }
         }
@@ -4926,6 +4931,16 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         backend_ctx->comm_ar_prepare != nullptr && backend_ctx->comm_ar_launch_rank != nullptr &&
         backend_ctx->tps > 1 && backend_ctx->n_stages * backend_ctx->tps == n_backends &&
         backend_ctx->comm_ctxs.size() >= backend_ctx->n_stages) {
+
+        // The token graph records every kernel of the token, so the lanes' own per-subgraph caches only add recording work on top.
+        if (!backend_ctx->inner_graphs_disabled && backend_ctx->n_stages == 1 &&
+                backend_ctx->graph_cache_disable != nullptr) {
+            for (size_t j = 0; j < n_backends; j++) {
+                backend_ctx->graph_cache_disable(backend_ctx->backend_configs[j].backend);
+            }
+            backend_ctx->inner_graphs_disabled = true;
+            GGML_LOG_DEBUG("%s: token graph owns the token, per-subgraph graph caches off\n", __func__);
+        }
 
         auto * tge = backend_ctx->tg_lookup(cgraph->uid);
 
