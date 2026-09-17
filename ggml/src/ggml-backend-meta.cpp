@@ -2619,6 +2619,7 @@ struct ggml_backend_meta_context {
         size_t              stage     = 0;
         size_t              i_beg     = 0;   // first subgraph in the run
         size_t              i_end     = 0;   // one past the last
+        size_t              seam      = SIZE_MAX; // TRANSFER subgraph that ends the run, SIZE_MAX for the last one
         std::vector<void *> exec;            // one graph per lane of this stage
     };
     struct tg_entry {
@@ -4962,6 +4963,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         backend_ctx->tg_graph_launch(
                             backend_ctx->backend_configs[lane_lo + k].backend, r.exec[k]);
                     }
+                    if (r.seam != SIZE_MAX) {
+                        const size_t stage_b = backend_ctx->subgraphs[r.seam + 1].stage;
+                        const ggml_status st = stage_transfer(r.seam, r.stage, stage_b);
+                        if (st != GGML_STATUS_SUCCESS) {
+                            return st;
+                        }
+                    }
                 }
                 if (tge->covered >= backend_ctx->n_subgraphs) {
                     return GGML_STATUS_SUCCESS;
@@ -5021,10 +5029,12 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         break;
                     }
                     if (sg.closure == ggml_backend_meta_context::subgraph_closure::TRANSFER) {
-                        // multi-stage shapes are not captured
-                        runs.clear();
+                        // A stage seam ends the run. Its nodes belong to the stage that produced them and stay inside the capture.
+                        // The transfer itself is host work between two launches, so it is replayed, not recorded.
+                        cur.seam = i;
+                        runs.push_back(cur);
                         open = false;
-                        break;
+                        continue;
                     }
                 }
                 if (open) {
@@ -5032,10 +5042,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
             }
 
-            // Multi-stage capture stays off: it produced wrong results on MoE
-            // targets and measured no win, the stage transfer reintroduces the
-            // barrier skew the capture removes.
-            bool eligible = !runs.empty() && backend_ctx->n_stages == 1;
+            // A multi-stage shape captures one run per stage, with the seam transfers replayed between them.
+            bool eligible = !runs.empty();
             for (const auto & r : runs) {
                 if (r.i_end <= r.i_beg) { eligible = false; break; }
                 if (backend_ctx->comm_ctxs[r.stage] == nullptr) { eligible = false; break; }
@@ -5102,6 +5110,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         for (size_t k = 0; k < backend_ctx->tps; k++) {
                             backend_ctx->tg_graph_launch(
                                 backend_ctx->backend_configs[lane_lo + k].backend, r.exec[k]);
+                        }
+                        if (r.seam != SIZE_MAX) {
+                            const size_t stage_b = backend_ctx->subgraphs[r.seam + 1].stage;
+                            const ggml_status st = stage_transfer(r.seam, r.stage, stage_b);
+                            if (st != GGML_STATUS_SUCCESS) {
+                                return st;
+                            }
                         }
                     }
                     GGML_LOG_DEBUG("%s: uid %zu captured %zu runs x %zu lanes, %zu/%zu subgraphs\n",
