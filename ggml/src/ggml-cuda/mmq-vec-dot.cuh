@@ -99,6 +99,56 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         }
     }
 }
+
+// Q4_0_64 dp8: 64-element scale groups. Same 16 dot8 per 128 as Q4_0, but loop runs 2x
+// (64 elems each) with one scale per 64, halving the FPU epilogue.
+template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q4_0_64_q4_0_64_dp8(
+        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps    = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
+    constexpr int I         = ggml_cuda_mmq_get_I(type, J, fallback);
+
+    constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_Q4_0_64, I);
+    const int * x_qs = (const int *) x;
+    const float * x_df = (const float *) x_qs + txs.qs;
+    const int * y_qs = (const int *) y + 2;
+    const half2 * y_ds = (const half2 *) y;
+
+    // Trip count is 2 (MMQ_TILE_NE_K / step), so "unroll 2" fully flattens this loop -
+    // unlike the Q4_0 dp8 kernel above, where unroll 2 on a 4-trip loop leaves a real
+    // loop. Full unroll here doubles the static dot8/ds_read/waitcnt count for no extra
+    // work, since the compiler can no longer share address/wait bookkeeping across the
+    // two iterations. Keep it a real loop instead.
+#pragma unroll 1
+    for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += 2*QR4_0*VDR_Q4_0_Q8_1_MMQ) {
+        const int k0 = k00 + k01;
+
+#pragma unroll
+        for (int j0 = 0; j0 < J; j0 += nwarps) {
+            const int j = j0 + threadIdx.y;
+
+#pragma unroll
+            for (int i0 = 0; i0 < I; i0 += warp_size) {
+                const int i = i0 + threadIdx.x;
+                const int4 u4a = *(const int4 *)(y_qs + j * MMQ_TILE_Y_DP8_K_64 + k01/2);
+                const int4 u4b = *(const int4 *)(y_qs + j * MMQ_TILE_Y_DP8_K_64 + k01/2 + 4);
+
+                int sumi = 0;
+                sumi = ggml_cuda_dp8_i4(x_qs[i*(MMQ_TILE_NE_K + 1) + k0/QR4_0 + 0], u4a.x, sumi);
+                sumi = ggml_cuda_dp8_i4(x_qs[i*(MMQ_TILE_NE_K + 1) + k0/QR4_0 + 1], u4a.y, sumi);
+                sumi = ggml_cuda_dp8_i4(x_qs[i*(MMQ_TILE_NE_K + 1) + k0/QR4_0 + 2], u4a.z, sumi);
+                sumi = ggml_cuda_dp8_i4(x_qs[i*(MMQ_TILE_NE_K + 1) + k0/QR4_0 + 3], u4a.w, sumi);
+                sumi = ggml_cuda_dp8_i4(x_qs[i*(MMQ_TILE_NE_K + 1) + k0/QR4_0 + 4], u4b.x, sumi);
+                sumi = ggml_cuda_dp8_i4(x_qs[i*(MMQ_TILE_NE_K + 1) + k0/QR4_0 + 5], u4b.y, sumi);
+                sumi = ggml_cuda_dp8_i4(x_qs[i*(MMQ_TILE_NE_K + 1) + k0/QR4_0 + 6], u4b.z, sumi);
+                sumi = ggml_cuda_dp8_i4(x_qs[i*(MMQ_TILE_NE_K + 1) + k0/QR4_0 + 7], u4b.w, sumi);
+
+                const float2 ds8f = __half22float2(y_ds[j*MMQ_TILE_Y_DP8_K_64 + k01/(2*QI8_1)]);
+                sum[j0/nwarps*I/warp_size + i0/warp_size] += x_df[i*(MMQ_TILE_NE_K/QI4_0_64) + i/QI4_0_64 + k0/(QR4_0_64*QI4_0_64)] * sumi * ds8f.x;
+            }
+        }
+    }
+}
 #endif
 
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q4_1_q8_1_dp4a(

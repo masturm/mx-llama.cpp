@@ -103,6 +103,9 @@ typedef sycl::half2 ggml_half2;
 #define QI4_0 (QK4_0 / (4 * QR4_0))
 #define QR4_0 2
 
+#define QI4_0_64 (QK4_0_64 / (4 * QR4_0_64))
+#define QR4_0_64 2
+
 #define QI4_1 (QK4_1 / (4 * QR4_1))
 #define QR4_1 2
 
@@ -197,6 +200,15 @@ typedef struct {
     uint8_t qs[QK4_0 / 2]; // nibbles / quants
 } block_q4_0;
 static_assert(sizeof(block_q4_0) == sizeof(ggml_half) + QK4_0 / 2, "wrong q4_0 block size/padding");
+
+// Q4_0 with 64-element scale groups: same 4-bit values as Q4_0, but one scale per 64 elements
+// instead of per 32. Used to amortize the dp8 FPU epilogue (see q4_groupsize_experiment_plan.md).
+#define QK4_0_64 64
+typedef struct {
+    ggml_half d;            // delta
+    uint8_t qs[QK4_0_64 / 2]; // nibbles / quants
+} block_q4_0_64;
+static_assert(sizeof(block_q4_0_64) == sizeof(ggml_half) + QK4_0_64 / 2, "wrong q4_0_64 block size/padding");
 
 #define QK4_1 32
 typedef struct {

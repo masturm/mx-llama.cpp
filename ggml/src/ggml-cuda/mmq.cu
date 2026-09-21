@@ -16,6 +16,9 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
         case GGML_TYPE_Q4_0:
             mul_mat_q_case<GGML_TYPE_Q4_0>(ctx, args, stream);
             break;
+        case GGML_TYPE_Q4_0_64:
+            mul_mat_q_case<GGML_TYPE_Q4_0_64>(ctx, args, stream);
+            break;
         case GGML_TYPE_Q4_1:
             mul_mat_q_case<GGML_TYPE_Q4_1>(ctx, args, stream);
             break;
@@ -130,7 +133,8 @@ void ggml_cuda_mul_mat_q(
 
     const bool use_native_fp4 = blackwell_mma_available(cc) && (src0->type == GGML_TYPE_MXFP4 || src0->type == GGML_TYPE_NVFP4);
     const bool use_q4_0_dp8 = mmq_use_q4_0_dp8(src0->type, cc);
-    const size_t y_block_size       = use_native_fp4 ? sizeof(block_fp4_mmq) : use_q4_0_dp8 ? sizeof(block_q4_0_mmq_dp8) : sizeof(block_q8_1_mmq);
+    const bool use_q4_0_64_dp8 = mmq_use_q4_0_64_dp8(src0->type, cc);
+    const size_t y_block_size       = use_native_fp4 ? sizeof(block_fp4_mmq) : use_q4_0_dp8 ? sizeof(block_q4_0_mmq_dp8) : use_q4_0_64_dp8 ? sizeof(block_q4_0_64_mmq_dp8) : sizeof(block_q8_1_mmq);
     const size_t y_values_per_block = use_native_fp4 ? QK_FP4_MMQ            : QK8_1_MMQ;
 
     if (!ids) {
@@ -154,7 +158,7 @@ void ggml_cuda_mul_mat_q(
             const int64_t qs12 = src1->nb[2] / ts_src1;
             const int64_t qs13 = src1->nb[3] / ts_src1;
             if (!use_native_fp4 && ctx.mmq_workspace_cols_cap == 0) {
-                const int variant = 1 + (int) mmq_get_q8_1_ds_layout(src0->type) + 4*use_q4_0_dp8;
+                const int variant = 1 + (int) mmq_get_q8_1_ds_layout(src0->type) + 4*(use_q4_0_dp8 || use_q4_0_64_dp8);
                 src1_q8_1_ptr = ggml_cuda_q8_1_cache_acquire(ctx, src1, variant, ne10_padded,
                                                              qs11, qs12, qs13, workspace_nbytes(ne11),
                                                              src1_q8_1_hit, &cache_pressure);
@@ -376,6 +380,7 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q2_0:
         case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_0_64:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:

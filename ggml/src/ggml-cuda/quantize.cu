@@ -455,13 +455,13 @@ static __global__ void quantize_mmq_mxfp4(const float * __restrict__ x,
 }
 
 // scatter: grid over tokens, quantize once, write to all the token's compact rows
-template <mmq_q8_1_ds_layout ds_layout, bool scatter, bool q4_0>
+template <mmq_q8_1_ds_layout ds_layout, bool scatter, bool q4_0, bool q4_0_64 = false>
 static __global__ void quantize_mmq_q8_1(
         const float * __restrict__ x, const int32_t * __restrict__ ids, void * __restrict__ vy,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
         const int64_t ne0, const int ne1, const int ne2, const int n_expert_used) {
 
-    constexpr int vals_per_scale = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 64 : 32;
+    constexpr int vals_per_scale = (ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 || q4_0_64) ? 64 : 32;
     constexpr int vals_per_sum   = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 16 : 32;
 
     const int64_t i0 = ((int64_t)blockDim.x*blockIdx.y + threadIdx.x)*4;
@@ -486,6 +486,7 @@ static __global__ void quantize_mmq_q8_1(
     const float4 * x4 = (const float4 *) x;
     block_q8_1_mmq * y = (block_q8_1_mmq *) vy;
     block_q4_0_mmq_dp8 * y4 = (block_q4_0_mmq_dp8 *) vy;
+    block_q4_0_64_mmq_dp8 * y4_64 = (block_q4_0_64_mmq_dp8 *) vy;
 
     const int64_t k_block = i0 / QK8_1_MMQ; // column block in the channel
     const int64_t iqs     = i0 % QK8_1_MMQ; // quant index in block
@@ -535,13 +536,13 @@ static __global__ void quantize_mmq_q8_1(
     }
 
     float d_inv;
-    if constexpr (q4_0) {
+    if constexpr (q4_0 || q4_0_64) {
         d_inv = max_value == 0.0f ? 0.0f : -8.0f / max_value;
     } else {
         d_inv = 127.0f / amax;
     }
     char4 q;
-    if constexpr (q4_0) {
+    if constexpr (q4_0 || q4_0_64) {
         q.x = max(-8, min(7, (int) truncf(xi.x*d_inv + 8.5f) - 8));
         q.y = max(-8, min(7, (int) truncf(xi.y*d_inv + 8.5f) - 8));
         q.z = max(-8, min(7, (int) truncf(xi.z*d_inv + 8.5f) - 8));
@@ -556,7 +557,7 @@ static __global__ void quantize_mmq_q8_1(
 
     [[maybe_unused]] uint32_t q4;
     [[maybe_unused]] uint32_t q4_peer;
-    if constexpr (q4_0){
+    if constexpr (q4_0 || q4_0_64){
         q4 = static_cast<uint8_t>(q.x) | 
             static_cast<uint32_t>(static_cast<uint8_t>(q.y)) << 8 | 
             static_cast<uint32_t>(static_cast<uint8_t>(q.z)) << 16 | 
@@ -577,9 +578,9 @@ static __global__ void quantize_mmq_q8_1(
             ib = ib0 + k_block*ne1 + blockIdx.x;
         }
 
-        if constexpr (q4_0) {
+        if constexpr (q4_0 || q4_0_64) {
             if(iqs % vals_per_scale < vals_per_scale/2) {
-                int * yqs = y4[ib].qs;
+                int * yqs = (q4_0_64 ? y4_64[ib].qs : y4[ib].qs);
                 yqs[(iqs/vals_per_scale)*(vals_per_scale/8) + (iqs % vals_per_scale)/4] = ggml_cuda_pack_i4x8((int) q4, (int) q4_peer);
             }
         } else {
@@ -591,6 +592,10 @@ static __global__ void quantize_mmq_q8_1(
         if constexpr (q4_0) {
             if(iqs % 32 == 0) {
                 y4[ib].ds4[iqs/32] = make_half2(d, sum);
+            }
+        } else if constexpr (q4_0_64) {
+            if(iqs % 64 == 0) {
+                y4_64[ib].ds2[iqs/64] = make_half2(d, sum);
             }
         } else if (ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6) {
             if (iqs % 16 == 0 && iqs < 96) {
@@ -659,6 +664,12 @@ void quantize_mmq_q8_1_cuda(
             if (type_src0 == GGML_TYPE_Q4_0 && (ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_VEGA20
                     || GGML_CUDA_CC_IS_RDNA2(ggml_cuda_info().devices[ggml_cuda_get_device()].cc))) {
                 quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4, false, true>
+                    <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
+                break;
+            }
+            if (type_src0 == GGML_TYPE_Q4_0_64 && (ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_VEGA20
+                    || GGML_CUDA_CC_IS_RDNA2(ggml_cuda_info().devices[ggml_cuda_get_device()].cc))) {
+                quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4, false, false, true>
                     <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
                 break;
             }

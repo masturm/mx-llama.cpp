@@ -51,6 +51,12 @@ struct block_q4_0_mmq_dp8 {
     int   qs[QK8_1_MMQ / 8];
 };
 
+// Q4_0_64 dp8: 16 packed signed int4 operands and two scales (64-element groups)
+struct block_q4_0_64_mmq_dp8 {
+    half2 ds2[2];
+    int   qs[QK8_1_MMQ / 8];
+};
+
 // this struct is used for fp4 data types (currently only used for Blackwell)
 // mxfp4 has block size 32, each int32 of d4 contains 2 e8m0 scales in the lower 16 bits
 // nvfp4 has block size 16, each int32 of d4 contains 4 ue4m3 scales
@@ -63,6 +69,7 @@ static_assert(sizeof(block_q8_1_mmq) == QK8_1_MMQ + 4*sizeof(half2), "Unexpected
 static_assert(sizeof(block_q8_1_mmq) == 4*sizeof(block_q8_1),      "Unexpected block_q8_1_mmq size");
 static_assert(sizeof(block_fp4_mmq)  == sizeof(block_q8_1_mmq),    "Unexpected block_fp4_mmq size");
 static_assert(sizeof(block_q4_0_mmq_dp8)  == QK8_1_MMQ/2 + 4* sizeof(half2),    "Unexpected block_q4_0_mmq_dp8 size");
+static_assert(sizeof(block_q4_0_64_mmq_dp8) == QK8_1_MMQ/2 + 2* sizeof(half2),  "Unexpected block_q4_0_64_mmq_dp8 size");
 
 static constexpr __host__ __device__ bool mmq_use_q4_0_dp8(const ggml_type type, const int cc) {
 #if defined(GGML_CUDA_Q4_0_INT4_ACTIVATIONS)
@@ -74,9 +81,21 @@ static constexpr __host__ __device__ bool mmq_use_q4_0_dp8(const ggml_type type,
 #endif
 }
 
+static constexpr __host__ __device__ bool mmq_use_q4_0_64_dp8(const ggml_type type, const int cc) {
+#if defined(GGML_CUDA_Q4_0_INT4_ACTIVATIONS)
+    return type == GGML_TYPE_Q4_0_64 && (cc == GGML_CUDA_CC_VEGA20 || GGML_CUDA_CC_IS_RDNA2(cc));
+#else
+    GGML_UNUSED(type);
+    GGML_UNUSED(cc);
+    return false;
+#endif
+}
+
 template <ggml_type type> static constexpr __device__ int mmq_get_y_block_size() {
 #if defined(GGML_CUDA_Q4_0_INT4_ACTIVATIONS) && (defined(__gfx906__) || defined(RDNA2))
-    return type == GGML_TYPE_Q4_0 ? sizeof(block_q4_0_mmq_dp8) : sizeof(block_q8_1_mmq);
+    if (type == GGML_TYPE_Q4_0)   return sizeof(block_q4_0_mmq_dp8);
+    if (type == GGML_TYPE_Q4_0_64) return sizeof(block_q4_0_64_mmq_dp8);
+    return sizeof(block_q8_1_mmq);
 #else
     return sizeof(block_q8_1_mmq);
 #endif
@@ -88,6 +107,7 @@ static mmq_q8_1_ds_layout mmq_get_q8_1_ds_layout(const ggml_type type_x) {
         case GGML_TYPE_Q2_0:
             return MMQ_Q8_1_DS_LAYOUT_D4;
         case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_0_64:
         case GGML_TYPE_Q4_1:
             return MMQ_Q8_1_DS_LAYOUT_DS4;
         case GGML_TYPE_Q5_0:
@@ -144,6 +164,7 @@ struct tile_x_sizes {
 #define MMQ_TILE_Y_K     (MMQ_TILE_NE_K + MMQ_TILE_NE_K / QI8_1)
 #define MMQ_TILE_Y_FP4_K MMQ_TILE_Y_K
 #define MMQ_TILE_Y_DP8_K (sizeof(block_q4_0_mmq_dp8) / sizeof(int))
+#define MMQ_TILE_Y_DP8_K_64 (sizeof(block_q4_0_64_mmq_dp8) / sizeof(int))
 
 enum ggml_cuda_mmq_sram_layout {
     GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0,
@@ -411,6 +432,7 @@ static constexpr __device__ int ggml_cuda_mmq_get_rows_per_warp(ggml_type type, 
 }
 
 #define MMQ_DP4A_TXS_Q4_0    tile_x_sizes{I*MMQ_TILE_NE_K   + I, I*MMQ_TILE_NE_K/QI4_0   + I/QI4_0,     0}
+#define MMQ_DP4A_TXS_Q4_0_64 tile_x_sizes{I*MMQ_TILE_NE_K   + I, I*MMQ_TILE_NE_K/QI4_0_64 + I/QI4_0_64,  0}
 #define MMQ_DP4A_TXS_Q4_1    tile_x_sizes{I*MMQ_TILE_NE_K   + I, I*MMQ_TILE_NE_K/QI4_1   + I/QI4_1,     0}
 #define MMQ_DP4A_TXS_Q8_0    tile_x_sizes{I*MMQ_TILE_NE_K*2 + I, I*MMQ_TILE_NE_K*2/QI8_0 + I/(QI8_0/2), 0}
 #define MMQ_DP4A_TXS_Q8_0_16 tile_x_sizes{I*MMQ_TILE_NE_K*2 + I, I*MMQ_TILE_NE_K*4/QI8_0 + I/(QI8_0/4), 0}
@@ -426,6 +448,7 @@ static constexpr __host__ __device__ tile_x_sizes mmq_get_dp4a_tile_x_sizes(ggml
         case GGML_TYPE_Q1_0:    return MMQ_DP4A_TXS_Q8_0;
         case GGML_TYPE_Q2_0:    return MMQ_DP4A_TXS_Q8_0;
         case GGML_TYPE_Q4_0:    return MMQ_DP4A_TXS_Q4_0;
+        case GGML_TYPE_Q4_0_64: return MMQ_DP4A_TXS_Q4_0_64;
         case GGML_TYPE_Q4_1:    return MMQ_DP4A_TXS_Q4_1;
         case GGML_TYPE_Q5_0:    return MMQ_DP4A_TXS_Q8_0;
         case GGML_TYPE_Q5_1:    return MMQ_DP4A_TXS_Q8_1;
@@ -599,6 +622,20 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
                 return ggml_cuda_mmq_util_funcs(
                     VDR_Q4_0_Q8_1_MMQ,
                     ggml_cuda_mmq_load_tiles_q4_0<type, J, fallback>,
+                    ggml_cuda_mmq_vec_dot_q4_0_q8_1_dp4a<type, J, fallback>,
+                    ggml_cuda_mmq_write_back_dp4a<type, J, fallback>);
+#endif
+            case GGML_TYPE_Q4_0_64:
+#if defined(GGML_CUDA_Q4_0_INT4_ACTIVATIONS) && (defined(__gfx906__) || defined(RDNA2))
+                return ggml_cuda_mmq_util_funcs(
+                    VDR_Q4_0_Q8_1_MMQ,
+                    ggml_cuda_mmq_load_tiles_q4_0_64<type, J, fallback>,
+                    ggml_cuda_mmq_vec_dot_q4_0_64_q4_0_64_dp8<type, J, fallback>,
+                    ggml_cuda_mmq_write_back_dp4a<type, J, fallback>);
+#else
+                return ggml_cuda_mmq_util_funcs(
+                    VDR_Q4_0_Q8_1_MMQ,
+                    ggml_cuda_mmq_load_tiles_q4_0_64<type, J, fallback>,
                     ggml_cuda_mmq_vec_dot_q4_0_q8_1_dp4a<type, J, fallback>,
                     ggml_cuda_mmq_write_back_dp4a<type, J, fallback>);
 #endif

@@ -624,12 +624,12 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
         else if (ftype == LLAMA_FTYPE_MOSTLY_Q4_K_S && arch != LLM_ARCH_FALCON && i_layer < n_layer/8) {
             new_type = GGML_TYPE_Q5_K;
         }
-        else if ((ftype == LLAMA_FTYPE_MOSTLY_Q4_0 || ftype == LLAMA_FTYPE_MOSTLY_Q5_0)
+        else if ((ftype == LLAMA_FTYPE_MOSTLY_Q4_0 || ftype == LLAMA_FTYPE_MOSTLY_Q5_0 || ftype == LLAMA_FTYPE_MOSTLY_Q4_0_64)
                 && qs.has_imatrix && i_layer < n_layer/8) {
             // Guard against craziness in the first few ffn_down layers that can happen even with imatrix for Q4_0/Q5_0.
             // We only do it when an imatrix is provided because a) we want to make sure that one can always get the
             // same quantization as before imatrix stuff, and b) Q4_1/Q5_1 do go crazy on ffn_down without an imatrix.
-            new_type = ftype == LLAMA_FTYPE_MOSTLY_Q4_0 ? GGML_TYPE_Q4_1 : GGML_TYPE_Q5_1;
+            new_type = (ftype == LLAMA_FTYPE_MOSTLY_Q4_0 || ftype == LLAMA_FTYPE_MOSTLY_Q4_0_64) ? GGML_TYPE_Q4_1 : GGML_TYPE_Q5_1;
         }
         ++qs.i_ffn_down;
     } else if (category == tensor_category::ATTENTION_OUTPUT) {
@@ -856,6 +856,7 @@ ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
         case LLAMA_FTYPE_ALL_F32:     return GGML_TYPE_F32;
         case LLAMA_FTYPE_MOSTLY_Q1_0: return GGML_TYPE_Q1_0;
         case LLAMA_FTYPE_MOSTLY_Q2_0: return GGML_TYPE_Q2_0;
+        case LLAMA_FTYPE_MOSTLY_Q4_0_64: return GGML_TYPE_Q4_0_64;
 
         case LLAMA_FTYPE_MOSTLY_MXFP4_MOE: return GGML_TYPE_MXFP4;
 
