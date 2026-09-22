@@ -4,8 +4,11 @@ Plan to explore larger Q4 quantization group sizes as the next big speedup lever
 the dp8 Q4_0 kernel, and to test the hypothesis that attention layers are more
 sensitive to large groups than FFN layers.
 
-Status: PLAN (not started). Supersedes nothing; the 32-block dp8 kernel stays as-is
-until (and unless) this experiment justifies the larger-block work.
+Status: Phase 1 (accuracy) and Phase 3 (real Q4_0_64 kernel) done. The Q4_0_64
+prefill regression was root-caused (unaligned LDS reads) and fixed - Q4_0_64 is
+now ~9% FASTER than Q4_0 on pp1024 (8446 vs 7731 t/s). Remaining: a perplexity
+number (decode/mmvq not yet implemented for this type, see
+q40_64_decode_fix_plan.md), then decide ship 64 vs 128.
 
 ---
 
@@ -269,18 +272,37 @@ Ruled out, with measurements (see `q40_64_decode_fix_plan.md` for the full log):
   *worse* (5824 -> 5688 t/s), because the second live accumulator across all 32
   unrolled `(i,j)` slots raised VGPR 207 -> 239. Reverted.
 
-**Still unexplained.** gfx1030 has no cache/VALU counters (PROFILE-NAVI21.md
-section 10), so the remaining ~25% gap can't be attributed with hardware counters,
-only further A/B kernel-structure experiments. This also means **Phase 2's
-`mmq-bench` prediction did not transfer to the real, integrated MMQ kernel** - the
-synthetic microbenchmark's VOP/LDS model was too simple (missing something in
-`load_tiles`, the y-tile copy, or the two-vec_dot-calls-per-outer-iteration
-structure that the standalone benchmark doesn't reproduce).
+**RESOLVED (2026-09-22): the gap was unaligned LDS reads, now fixed.**
+Disassembling both `mul_mat_q<J=64>` kernels (`tools/kernel-disasm.py`) showed the
+Q4_0_64 y-tile row is `sizeof(block_q4_0_64_mmq_dp8)` = 72B (2 half2 scales + 16
+int qs) vs Q4_0's 80B (4 half2 scales + 16 int qs). The vec_dot reads the 128-bit
+qs chunks as `int4` = `ds_read_b128`, which needs 16B alignment. With a 72B row
+(qs at +8B) every y b128 read lands on an 8B boundary (offsets 264, 280, 840, ...
+= 8 mod 16); Q4_0's are all 16B-aligned (272, 288, 912, ... = 0 mod 16). On RDNA
+an unaligned b128 splits into multiple LDS transactions, so the y-operand fetch
+(32 b128 per kb0 iteration) paid up to 4x Q4_0's LDS cost for the same data -
+swamping the halved FPU epilogue. That is the whole regression; compute (512
+dot8) and the epilogue halving were already correct. (Full log in
+`q40_64_decode_fix_plan.md`.)
 
-**Consequence for this plan:** do not start the Q4_0_128 kernel or the
-attn/ffn group-size sweep until the Q4_0_64 regression is understood - Phase 2's
-speedup model is now known to be unreliable for the real kernel, and there is
-still no perplexity number to weigh against the (currently negative) speed number.
+Fix: pad `block_q4_0_64_mmq_dp8` to 80B (add `int pad[2]` so qs sits at +16B,
+matching Q4_0's geometry). Only the struct, its static_assert, and the vec_dot
+`y_qs` offset (+2 -> +4) needed manual changes; the quantize writer, the y-tile
+copy, `mmq_get_nbytes_shared`, and the workspace size all derive from `sizeof`
+and update automatically. After the fix the b128 offsets are 272, 288, 912, ...
+(all 16B-aligned) and the kernel matches Q4_0's LDS pattern.
+
+**Measured (2026-09-22, same build, Qwen3.5-2B, V620 gfx1030, pp1024 ub512):**
+Q4_0_64 **8446 t/s** vs Q4_0 baseline **7731 t/s** - now **~9% FASTER**. The sign
+flipped from -27% to +9%. The end-to-end gain is below Phase 2's 1.15-1.33x
+pure-MMQ-compute prediction, as expected: pp1024 also includes non-MMQ work
+(attention scores, embeddings, norms) that does not scale with the MMQ block size.
+
+**Consequence for this plan:** the Q4_0_64 prefill regression is root-caused and
+fixed, so the Q4_0_128 kernel and the attn/ffn group-size sweep are unblocked on
+the speed side. What is still missing is a **perplexity number**: decode (mmvq)
+is not implemented for this type (see `q40_64_decode_fix_plan.md`), so the
+accuracy side of the tradeoff is still unpriced.
 
 ---
 
@@ -408,12 +430,12 @@ Remaining, in order of cost:
 Tradeoff so far: uniform group size; activation error 32->64 ~12->15%, 32->128 ~12->20%; for
 ~1.15-1.6x MMQ compute speedup. Whether it's worth it is a perplexity question (Phase 3).
 
-**Update (2026-09-21): Phase 3's real Q4_0_64 kernel is currently a ~25% pp1024
-REGRESSION, not a speedup** (see "Phase 3 kernel RESULTS" above) - Phase 2's
-`mmq-bench` prediction did not hold up in the integrated MMQ kernel, and one
-confirmed bug fix only recovered a fraction of it. There is also still no
-perplexity number (decode/mmvq is unimplemented for this type). Q4_0_128 and the
-attn/ffn group-size sweep are on hold until the regression is root-caused - the
-accuracy-side conclusions above (uniform group size, activation is the accuracy
-bottleneck) still stand, but the speed side of the tradeoff is currently negative,
-not the modeled 1.15-1.6x gain.
+**Update (2026-09-22): the Q4_0_64 prefill regression is fixed.** The ~25% pp1024
+regression was root-caused to unaligned LDS reads from the 72B y-tile row and
+fixed by padding `block_q4_0_64_mmq_dp8` to 80B (see "Phase 3 kernel RESULTS"
+above). Q4_0_64 is now **~9% FASTER** than Q4_0 on pp1024 (8446 vs 7731 t/s).
+There is still no perplexity number (decode/mmvq is unimplemented for this type,
+tracked in `q40_64_decode_fix_plan.md`), so the accuracy side of the tradeoff is
+unpriced. The accuracy-side conclusions above (uniform group size, activation is
+the accuracy bottleneck) still stand. Q4_0_128 and the attn/ffn group-size sweep
+are now unblocked on the speed side; the remaining gate is a perplexity number.

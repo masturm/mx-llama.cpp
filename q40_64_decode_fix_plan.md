@@ -83,12 +83,13 @@ decode perf matters:
 4. Re-run `llama-bench` pp1024 to confirm prefill perf is unchanged by the
    decode fix (it should be - separate path).
 
-## Open question (separate from this fix)
-The prefill (mmq) Q4_0_64 kernel is 27% SLOWER than Q4_0 (5626 vs 7718 t/s), the
-opposite of the expected speedup. This is a distinct issue from the decode gap
-and needs its own investigation (disassemble Q4_0_64 dp8 kernel vs Q4_0, diff the
-instruction mix, check for spills / suboptimal J). The decode fix does not address
-it.
+## Prefill (mmq) regression (separate from this fix) - RESOLVED
+The prefill (mmq) Q4_0_64 kernel was 27% SLOWER than Q4_0 (5626 vs 7718 t/s), the
+opposite of the expected speedup. This is a distinct issue from the decode gap and
+is now root-caused and fixed: unaligned LDS reads from the 72B y-tile row (see
+"Prefill (mmq) regression: root cause" below). After the fix Q4_0_64 is ~9%
+FASTER than Q4_0 (8446 vs 7731 t/s). The decode fix does not address it, and this
+fix does not address decode.
 
 ### Investigation (2026-09-21, on the V620)
 
@@ -150,3 +151,87 @@ the (or at least not a cheaply-fixable) lever - do not retry this shape without
 also finding a way to avoid the extra live accumulators (e.g. reusing one of
 the two i0/j0-unrolled slots' registers, which would need a real restructure,
 not a local one).
+
+## Prefill (mmq) regression: root cause found - unaligned y reads (2026-09-22)
+
+Disassembled both `mul_mat_q<..., J=64, fallback=false>` kernels (extracted
+from the `.hip_fatbin` section of `build-dp8-gfx1030/bin/libggml-hip.so` with
+`llvm-objdump`) and diffed the LDS read patterns.
+
+### High-level kernel overview
+
+Both dp8 kernels have the same structure: 256 threads (8 warps), each kb0
+iteration loads one x tile (I=128 rows x 256 elems, the weights = src0) and one
+y tile (J=64 rows x 128 elems, the quantized activations = src1) into LDS, then
+each warp walks its 8 y rows x 4 x rows in a fully unrolled j0/i0 grid with a
+small k01 inner loop. Per (i,j)
+pair and k01 trip each lane does 8 `v_dot8_i32_i4` (8 signed-nibble dot8s =
+64 elements), converts the accumulator to float, and does one FMA with
+`x_scale * y_scale`. Q4_0_64's only intended difference: one weight block
+covers 64 elements, so the k01 loop has 2 trips instead of 4 and the
+scale-convert/FMA epilogue runs half as often (amortization win).
+
+The y tile row in LDS is the quantized block struct itself:
+
+- Q4_0: `block_q4_0_mmq_dp8` = 4 half2 scales + 16 int qs = 80B (20 ints)
+- Q4_0_64: `block_q4_0_64_mmq_dp8` = 2 half2 scales + 16 int qs = 72B (18 ints)
+
+The vec_dot core reads the 128-bit qs chunks as `int4` = `ds_read_b128`, which
+requires 16B alignment to be a single LDS transaction.
+
+### The problem: Q4_0_64's y reads are 8B-unaligned
+
+- Q4_0: qs starts at +16B in the row, row stride 80B (multiple of 16B) ->
+  every b128 read is 16B-aligned. Disassembly offsets: 272, 288, 912, 928,
+  1552, ... (all = 0 mod 16).
+- Q4_0_64: qs starts at +8B in the row, row stride 72B (NOT a multiple of
+  16B) -> every b128 read lands on an 8B boundary. Disassembly offsets:
+  264, 280, 840, 856, 1416, ... (all = 8 mod 16).
+
+On RDNA2 an unaligned `ds_read_b128` is split into multiple smaller LDS
+transactions (2x b64 / 4x b32 worth of issue+LDS work). The y-operand fetch
+is 32 b128s per kb0 iteration, so Q4_0_64 pays up to 4x the LDS cost of the
+baseline for the same 4KB of y data - which swamps the halved FPU epilogue
+and explains the 1.61x per-dispatch time (399 vs 248 us) and the ~27% pp1024
+regression.
+
+### Instruction mix (static, per kb0 iteration, J=64)
+
+| op                 | Q4_0   | Q4_0_64 |
+|--------------------|--------|---------|
+| v_dot8_i32_i4      | 512    | 512     |
+| ds_read_b128 (y)   | 32     | 32      |
+| ds_read2_b32 (x)   | 56     | 40      |
+| ds_read_b32        | 8      | 16      |
+| v_cvt_f32_i32 (ep) | 128    | 64      |
+
+Compute (512 dot8s) is identical; the epilogue halving (128 -> 64 cvts) is
+present as designed. The x-side reads are the same shape in both. The one
+structural difference that matters is the alignment of the 32 y b128 reads
+(aligned in Q4_0, 8B-unaligned in Q4_0_64).
+
+### Fix (applied 2026-09-22)
+
+Pad `block_q4_0_64_mmq_dp8` to 80B (20 ints) so the LDS y row matches the Q4_0
+geometry: add 2 pad ints between the 2 scales and qs. Then qs starts at +16B,
+row stride is 80B, and all 32 y b128 reads are 16B-aligned again (disassembly
+offsets now 272, 288, 912, ... = 0 mod 16, identical to Q4_0). Cost: +8B per
+128 activations in the quantized workspace and the y tile (y tile at J=64:
+5120B vs 4608B, still far below the LDS budget).
+
+Only two manual edits were needed; everything else derives from `sizeof` or
+struct-member access and updates automatically:
+- `mmq.cuh`: add `int pad[2]` to `block_q4_0_64_mmq_dp8`, update its
+  static_assert to `sizeof(...) == sizeof(block_q4_0_mmq_dp8)`.
+- `mmq-vec-dot.cuh`: `y_qs` offset +2 -> +4 (qs now at int 4). The scale index
+  `k01/(2*QI8_1)` = k01/16 is already correct (QI8_1=8 -> half2 indices {0,1}
+  = ds2[0], ds2[1]) and is unchanged.
+- Nothing else: the `quantize_mmq_q8_1` writer uses struct-member access
+  (`.ds2`, `.qs`), the y-tile copy and `mmq_get_nbytes_shared` use `sizeof`,
+  and the workspace size in `mmq.cu` uses `sizeof` - all auto-update.
+
+**Result (2026-09-22, Qwen3.5-2B, V620 gfx1030, pp1024 ub512, same build):**
+Q4_0_64 **8446 t/s** vs Q4_0 baseline **7731 t/s** - now **~9% FASTER**, the
+regression is gone and the sign flipped from -27% to +9%. PPL still cannot be
+measured: decode (mmvq) is not implemented for this type (see the sections
+above), so the accuracy side of the tradeoff remains unpriced.

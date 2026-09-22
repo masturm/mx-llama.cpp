@@ -111,7 +111,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_Q4_0_64, I);
     const int * x_qs = (const int *) x;
     const float * x_df = (const float *) x_qs + txs.qs;
-    const int * y_qs = (const int *) y + 2;
+    // y row is 20 ints (80B) and 16B-aligned, so load the y operands as one 16B read
+    const int * y_qs = (const int *) y + 4;
     const half2 * y_ds = (const half2 *) y;
 
     // Trip count is 2 (MMQ_TILE_NE_K / step), so "unroll 2" fully flattens this loop -

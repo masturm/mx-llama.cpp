@@ -51,9 +51,12 @@ struct block_q4_0_mmq_dp8 {
     int   qs[QK8_1_MMQ / 8];
 };
 
-// Q4_0_64 dp8: 16 packed signed int4 operands and two scales (64-element groups)
+// Q4_0_64 dp8: 16 packed signed int4 operands and two scales (64-element groups).
+// pad keeps qs 16B-aligned in the LDS y tile, matching block_q4_0_mmq_dp8 (80B rows);
+// an unaligned int4 read would split into multiple LDS transactions and hurt prefill.
 struct block_q4_0_64_mmq_dp8 {
     half2 ds2[2];
+    int   pad[2];
     int   qs[QK8_1_MMQ / 8];
 };
 
@@ -69,7 +72,7 @@ static_assert(sizeof(block_q8_1_mmq) == QK8_1_MMQ + 4*sizeof(half2), "Unexpected
 static_assert(sizeof(block_q8_1_mmq) == 4*sizeof(block_q8_1),      "Unexpected block_q8_1_mmq size");
 static_assert(sizeof(block_fp4_mmq)  == sizeof(block_q8_1_mmq),    "Unexpected block_fp4_mmq size");
 static_assert(sizeof(block_q4_0_mmq_dp8)  == QK8_1_MMQ/2 + 4* sizeof(half2),    "Unexpected block_q4_0_mmq_dp8 size");
-static_assert(sizeof(block_q4_0_64_mmq_dp8) == QK8_1_MMQ/2 + 2* sizeof(half2),  "Unexpected block_q4_0_64_mmq_dp8 size");
+static_assert(sizeof(block_q4_0_64_mmq_dp8) == sizeof(block_q4_0_mmq_dp8),       "Unexpected block_q4_0_64_mmq_dp8 size");
 
 static constexpr __host__ __device__ bool mmq_use_q4_0_dp8(const ggml_type type, const int cc) {
 #if defined(GGML_CUDA_Q4_0_INT4_ACTIVATIONS)
@@ -1534,7 +1537,9 @@ struct mmq_args {
 static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const int cc) {
     const size_t nbs_ids = config.J*sizeof(int);
     const size_t nbs_x = ggml_cuda_mmq_get_nbytes_shared_x(config, cc);
-    const size_t nbs_y = config.J * (mmq_use_q4_0_dp8(config.type, cc) ? sizeof(block_q4_0_mmq_dp8) : sizeof(block_q8_1_mmq));
+    const size_t y_row_size = mmq_use_q4_0_dp8(config.type, cc) ? sizeof(block_q4_0_mmq_dp8) :
+        mmq_use_q4_0_64_dp8(config.type, cc) ? sizeof(block_q4_0_64_mmq_dp8) : sizeof(block_q8_1_mmq);
+    const size_t nbs_y = config.J * y_row_size;
     return nbs_ids + nbs_x + GGML_PAD(nbs_y, config.nthreads*sizeof(int));
 }
 
