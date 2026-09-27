@@ -51,12 +51,9 @@ struct block_q4_0_mmq_dp8 {
     int   qs[QK8_1_MMQ / 8];
 };
 
-// Q4_0_64 dp8: 16 packed signed int4 operands and two scales (64-element groups).
-// pad keeps qs 16B-aligned in the LDS y tile, matching block_q4_0_mmq_dp8 (80B rows);
-// an unaligned int4 read would split into multiple LDS transactions and hurt prefill.
+// Q4_0_64 dp8: 16 packed signed int4 operands and two scales (64-element groups)
 struct block_q4_0_64_mmq_dp8 {
     half2 ds2[2];
-    int   pad[2];
     int   qs[QK8_1_MMQ / 8];
 };
 
@@ -72,7 +69,7 @@ static_assert(sizeof(block_q8_1_mmq) == QK8_1_MMQ + 4*sizeof(half2), "Unexpected
 static_assert(sizeof(block_q8_1_mmq) == 4*sizeof(block_q8_1),      "Unexpected block_q8_1_mmq size");
 static_assert(sizeof(block_fp4_mmq)  == sizeof(block_q8_1_mmq),    "Unexpected block_fp4_mmq size");
 static_assert(sizeof(block_q4_0_mmq_dp8)  == QK8_1_MMQ/2 + 4* sizeof(half2),    "Unexpected block_q4_0_mmq_dp8 size");
-static_assert(sizeof(block_q4_0_64_mmq_dp8) == sizeof(block_q4_0_mmq_dp8),       "Unexpected block_q4_0_64_mmq_dp8 size");
+static_assert(sizeof(block_q4_0_64_mmq_dp8) == QK8_1_MMQ/2 + 2* sizeof(half2),  "Unexpected block_q4_0_64_mmq_dp8 size");
 
 static constexpr __host__ __device__ bool mmq_use_q4_0_dp8(const ggml_type type, const int cc) {
 #if defined(GGML_CUDA_Q4_0_INT4_ACTIVATIONS)

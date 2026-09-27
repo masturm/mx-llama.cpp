@@ -1,17 +1,56 @@
 # Q4_0_64 decode (mmvq) fix plan
 
-Status: PLANNED, not implemented.
+Status: PLANNED, not implemented. Two routes to a PPL number: (A) the proper
+mmvq kernel (recommended), or (B) a temporary "route decode through mmq" shim to
+get a PPL fast. See "Quick fix (B)" below for why (B) is less trivial than it
+sounds.
 
 ## Why
 
 `llama-perplexity` runs prefill (mmq) + decode (mmvq). The Q4_0_64 prefill (mmq)
-path is implemented and runs (5626 t/s pp1024), but the decode (mmvq) path aborts
-at `mmvq.cu:1347` (`default: GGML_ABORT("fatal error")`) because `GGML_TYPE_Q4_0_64`
-was never added to the decode kernel. This blocks the perplexity / correctness
-check needed for the ship/no-ship decision.
+path is implemented and runs (8446 t/s pp1024 after the alignment fix), but the
+decode (mmvq) path aborts at `mmvq.cu` (`default: GGML_ABORT("fatal error")`)
+because `GGML_TYPE_Q4_0_64` was never added to the decode kernel. This blocks the
+perplexity / correctness check needed for the ship/no-ship decision.
 
 The decode-path gap does NOT affect the prefill perf number (llama-bench pp1024
 is prefill-only and never touches mmvq).
+
+## Quick fix (B): route decode through the mmq kernel - finding
+
+Idea: make the decode path use the already-working mmq (prefill) kernel so we can
+measure PPL without writing the mmvq vec_dot. Perf will be far from optimal (mmq
+is a GEMM tile kernel, not a GEMV), but PPL only needs correctness.
+
+**Finding: it needs padding to ne11 = 8, so it is NOT actually quick.** The mmq
+kernel picks its J tile from `ggml_cuda_mmq_get_J_max` (`mmq.cuh:422`):
+
+    ret = min(ne11, 512); ret -= ret % 8;   // round DOWN to a multiple of 8
+    for (; ret > 0; ret -= 8) if (config exists) return ret;
+
+The Q4_0_64 config table (`mmq-config-rdna2.cuh`) only has J in
+{8,16,24,32,40,48,64} - minimum J is 8. For decode (ne11 = 1): min(1,512)=1,
+1%8=1 -> ret=0, so the mmq kernel gets **J = 0 (invalid)**. It cannot process a
+single token as-is.
+
+So "use mmq for decode" means padding the one decode token to 8 (1 real + 7
+zero). Concretely, in `ggml_cuda_mul_mat` (`ggml-cuda.cu:2578`):
+1. `ggml_cuda_should_use_mmvq` (`mmvq.cu:289`) must return false for Q4_0_64 so the
+   dispatch falls through to `ggml_cuda_should_use_mmq` (already true for this type
+   on gfx1030 - it is not CDNA, so the last line returns true).
+2. Allocate a temp F32 src1 buffer for 8 tokens; copy the 1 real token to slot 0,
+   zero the other 7.
+3. Allocate a temp F32 dst buffer for 8 tokens; run the mmq kernel; copy slot 0
+   back to the real dst.
+
+That is a temp-buffer + copy + dispatch change, and it makes decode ~8x slower
+than a real GEMV. It is more moving parts than the proper mmvq kernel below, and
+it leaves a decode-only shim to remove later. It is only worth it if we need a PPL
+number immediately and accept carrying the temporary code.
+
+**Recommendation:** implement the proper mmvq kernel (next section). It is small
+and self-contained (one vec_dot + three dispatch cases), gives the correct and
+fast decode path, and unblocks PPL cleanly.
 
 ## The core problem: 64-vs-32 block mismatch
 

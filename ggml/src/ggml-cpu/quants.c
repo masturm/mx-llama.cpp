@@ -276,18 +276,18 @@ void ggml_vec_dot_q4_0_64_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs
     const block_q4_0_64 * GGML_RESTRICT x = vx;
     const block_q8_0 * GGML_RESTRICT y = vy;
 
+    // one Q4_0_64 block (64 weights) maps to two Q8_0 blocks (2 * 32 = 64).
+    // qs[j] low nibble is elem j (first Q8_0 block), high nibble is elem j+32 (second block).
     float sumf = 0;
     for (int ib = 0; ib < nb; ++ib) {
         const int x_ib = ib / 2;
-        const int xo   = (ib % 2) * (QK4_0_64 / 4);
-        int sumi0 = 0, sumi1 = 0;
-        for (int j = 0; j < qk/2; ++j) {
-            const int v0 = (x[x_ib].qs[xo + j] & 0x0F) - 8;
-            const int v1 = (x[x_ib].qs[xo + j] >>   4) - 8;
-            sumi0 += v0 * y[ib].qs[j];
-            sumi1 += v1 * y[ib].qs[j + qk/2];
+        const int shift = (ib % 2) * 4;
+        int sumi = 0;
+        for (int j = 0; j < qk; ++j) {
+            const int v = ((x[x_ib].qs[j] >> shift) & 0x0F) - 8;
+            sumi += v * y[ib].qs[j];
         }
-        sumf += (sumi0 + sumi1) * GGML_CPU_FP16_TO_FP32(x[x_ib].d) * GGML_CPU_FP16_TO_FP32(y[ib].d);
+        sumf += sumi * GGML_CPU_FP16_TO_FP32(x[x_ib].d) * GGML_CPU_FP16_TO_FP32(y[ib].d);
     }
     *s = sumf;
 }

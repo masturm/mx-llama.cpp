@@ -789,6 +789,46 @@ static __device__ __forceinline__ float vec_dot_q4_0_q8_1(
     return vec_dot_q4_0_q8_1_impl<VDR_Q4_0_Q8_1_MMVQ>(v, u, bq4_0->d, bq8_1->ds);
 }
 
+// Q4_0_64: one weight scale per 64 elems. Nibble packing: qs[j] low nibble = elem j,
+// high nibble = elem j+32. So a 64-elem weight block spans two Q8_1 blocks: the low
+// nibbles pair with activation block 0 (elems 0-31), the high nibbles with block 1
+// (elems 32-63). Each half uses its own activation scale/sum, so the dp4a + correction
+// is split into two independent halves (correction 8*vdr/QI4_0_64 per half).
+static __device__ __forceinline__ float vec_dot_q4_0_64_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_q4_0_64 * bq4_0_64 = (const block_q4_0_64 *) vbq + kbx;
+    const block_q8_1 * bq8_1_lo = bq8_1;     // elems 0-31 of the 64-elem block
+    const block_q8_1 * bq8_1_hi = bq8_1 + 1; // elems 32-63
+
+    int v[VDR_Q4_0_Q8_1_MMVQ];
+    int u_lo[VDR_Q4_0_Q8_1_MMVQ];
+    int u_hi[VDR_Q4_0_Q8_1_MMVQ];
+
+#pragma unroll
+    for (int i = 0; i < VDR_Q4_0_Q8_1_MMVQ; ++i) {
+        v[i]    = get_int_b2(bq4_0_64->qs, iqs + i);
+        u_lo[i] = get_int_b4(bq8_1_lo->qs, iqs + i);
+        u_hi[i] = get_int_b4(bq8_1_hi->qs, iqs + i);
+    }
+
+    int sumi_lo = 0;
+    int sumi_hi = 0;
+#pragma unroll
+    for (int i = 0; i < VDR_Q4_0_Q8_1_MMVQ; ++i) {
+        const int vi0 = (v[i] >> 0) & 0x0F0F0F0F;
+        const int vi1 = (v[i] >> 4) & 0x0F0F0F0F;
+        sumi_lo = ggml_cuda_dp4a(vi0, u_lo[i], sumi_lo);
+        sumi_hi = ggml_cuda_dp4a(vi1, u_hi[i], sumi_hi);
+    }
+
+    const float2 ds_lo = __half22float2(bq8_1_lo->ds);
+    const float2 ds_hi = __half22float2(bq8_1_hi->ds);
+    const float corr = 8.0f * VDR_Q4_0_Q8_1_MMVQ / QI4_0_64;
+    const float d4 = __half2float(bq4_0_64->d);
+    return d4 * ((sumi_lo * ds_lo.x - corr * ds_lo.y) + (sumi_hi * ds_hi.x - corr * ds_hi.y));
+}
+
 
 static __device__ __forceinline__ float vec_dot_q4_1_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {

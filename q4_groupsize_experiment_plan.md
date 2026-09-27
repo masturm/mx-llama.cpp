@@ -59,11 +59,20 @@ path, so they're excluded here.)
 
 ## Key insight: the group size affects BOTH activations and weights
 
-The dp8 path is **W4A4**: both the activation (x) and the weight (y) are Q4_0 with
-per-32-block scales. To get the amortization, **both must use the larger group** - if
-the activation stayed at 32-block while the weight went to 128-block, the activation
-scale (x_df) would still change every 32 elements, forcing the FPU epilogue every 32
-anyway. So the group size is a single knob applied to both operands.
+The dp8 path is **W4A4**: both the weight (x) and the activation (y) are Q4_0 (4-bit)
+with per-32-block scales. (Kernel convention: x = src0 = the GGUF weights, y = src1 =
+the on-the-fly quantized activations; the weight scale is x_df, the activation scale
+is y_ds.) To get the amortization, **both must use the larger group** - if the
+activation (y) stayed at 32-block while the weight (x) went to 128-block, the
+activation scale (y_ds) would still change every 32 elements, forcing the FPU epilogue
+every 32 anyway. So the group size is a single knob applied to both operands.
+
+Note on the "q8_1" name: the activation is quantized by `quantize_mmq_q8_1` into the
+`src1_q8_1` workspace, but that name describes the *default* 8-bit path. This build
+defines `GGML_CUDA_Q4_0_INT4_ACTIVATIONS`, which routes Q4_0/Q4_0_64 to the int4 branch
+(`quantize.cu`), so the activation is also 4-bit - a true W4A4, and the MAC is
+`v_dot8_i32_i4` (int4 x int4) for both operands. Without that flag the activation would
+be 8-bit (the real q8_1) and ~2x the weight size.
 
 This makes the **activation quantization** the main accuracy risk, not the weight:
 - Activations (the residual stream) have **outliers** - a few channels with large
@@ -73,7 +82,7 @@ This makes the **activation quantization** the main accuracy risk, not the weigh
   feeding the projections), so they are more sensitive to a coarse group size.
 
 This refines the hypothesis: "attention hurts more" is plausibly driven by the
-**activation (x) quantization** in attention layers, not (only) the weight. The
+**activation (y) quantization** in attention layers, not (only) the weight. The
 experiments below test this directly.
 
 Note: GGML already has larger-block formats, but none is a *flat* large-group Q4:
@@ -92,7 +101,7 @@ compromise for the 128-block if flat is too lossy - a Phase 3 option.)
 
 - H1: Larger group sizes give a real compute speedup (confirm the model, Phase 2).
 - H2: Attention is more sensitive to large groups than FFN (the user's hypothesis).
-- H3: The activation (x) quantization is the dominant accuracy risk (vs the weight y).
+- H3: The activation (y) quantization is the dominant accuracy risk (vs the weight x).
 - H4: Some (group_attn, group_ffn) combination gives a good speedup at acceptable
   accuracy (a Pareto point worth shipping).
 
@@ -123,12 +132,12 @@ are sensitive, before investing in any kernel or type work.
   format is not viable; STOP (or pivot to two-level scaling, Phase 3 option).
 - If attention is clearly more sensitive -> confirms H2; use it to pick the
   (group_attn, group_ffn) combinations for Phase 3.
-- If the activation (x) error dominates the weight (y) error -> confirms H3; the
-  activation quantization is what to protect (e.g., keep x at 32-block, accept that the
+- If the activation (y) error dominates the weight (x) error -> confirms H3; the
+  activation quantization is what to protect (e.g., keep y at 32-block, accept that the
   FPU epilogue then fires every 32 - see the caveat below).
 
 **Caveat:** if the activation must stay at 32-block for accuracy (H3 strongly
-confirmed), the full 128-block amortization is NOT available (the x scale forces the
+confirmed), the full 128-block amortization is NOT available (the y scale forces the
 epilogue every 32). In that case the win shrinks to the weight-side benefit only, which
 is smaller. Phase 1b tells us whether this caveat bites.
 
@@ -303,6 +312,19 @@ fixed, so the Q4_0_128 kernel and the attn/ffn group-size sweep are unblocked on
 the speed side. What is still missing is a **perplexity number**: decode (mmvq)
 is not implemented for this type (see `q40_64_decode_fix_plan.md`), so the
 accuracy side of the tradeoff is still unpriced.
+
+**LDS read path is closed (2026-09-23): no further cheap gain.** After the
+alignment fix the y tile already uses the max-width `ds_read_b128` (broadcast,
+16B-aligned). The x tile (weights) is read as `ds_read2_b32` with a row stride of
+33 ints, chosen so 33 = 1 (mod 32) -> conflict-free b32 reads. Reading the x tile
+as b128 is a dead end: stride 33 makes a row 16B-aligned only when `lane % 4 == 0`
+(132 mod 16 = 4), so 24/32 lanes are misaligned. Measured: x-tile b128 = **5708
+t/s (-32%)** vs the b32 baseline (8446). The two requirements are mutually
+exclusive for a uniform stride - 16B-aligned b128 needs `stride = 0 (mod 4)`,
+conflict-free needs `stride` odd - and b128 cannot beat the b32 byte floor anyway
+(same data; the 8-cycle LDS minimum is already hit). Only a bank-swizzle would
+allow an aligned conflict-free b128, and it would not cut the byte traffic, so it
+is not worth the complexity.
 
 ---
 
