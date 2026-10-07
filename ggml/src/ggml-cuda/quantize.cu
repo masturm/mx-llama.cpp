@@ -499,7 +499,7 @@ static __global__ void quantize_mmq_q8_1(
     amax = fmaxf(amax, fabsf(xi.w));
 
     float max_value = 0.0f;
-    if constexpr (q4_0){
+    if constexpr (q4_0 || q4_0_64){
         max_value = xi.x;
         if(fabsf(xi.y) > fabsf(max_value)) {
             max_value = xi.y;
@@ -516,7 +516,7 @@ static __global__ void quantize_mmq_q8_1(
 #pragma unroll
     for (int offset = vals_per_scale/8; offset > 0; offset >>= 1) {
         amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, offset, WARP_SIZE));
-        if constexpr (q4_0) {
+        if constexpr (q4_0 || q4_0_64) {
             const float candidate = __shfl_xor_sync(0xFFFFFFFF, max_value, offset, WARP_SIZE);
             if(fabsf(candidate) > fabsf(max_value)) {
                 max_value = candidate;
