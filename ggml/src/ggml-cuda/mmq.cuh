@@ -223,7 +223,8 @@ struct ggml_cuda_mmq_config {
 #include "mmq-config-rdna3.cuh"
 #include "mmq-config-rdna3-5.cuh"
 #include "mmq-config-rdna4.cuh"
-#include "mmq-config-gfx906.cuh" // gfx906 wraps rdna2, must be included after it
+#include "mmq-config-gfx906.cuh"  // gfx906 wraps rdna2, must be included after it
+#include "mmq-config-gfx1030.cuh" // gfx1030 wraps rdna2, must be included after it
 
 #undef CASE
 
@@ -243,6 +244,9 @@ static __host__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(const ggml_type ty
         }
         if (cc == GGML_CUDA_CC_VEGA20) {
             return ggml_cuda_mmq_get_config_gfx906(type, J, fallback);
+        }
+        if (GGML_CUDA_CC_IS_RDNA2(cc)) {
+            return ggml_cuda_mmq_get_config_gfx1030(type, J, fallback);
         }
         return ggml_cuda_mmq_get_config_rdna2(type, J, fallback);
     }
@@ -270,6 +274,8 @@ static constexpr __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(ggml_t
     return ggml_cuda_mmq_get_config_rdna3(type, J, fallback);
 #elif defined(__gfx906__)
     return ggml_cuda_mmq_get_config_gfx906(type, J, fallback);
+#elif defined(RDNA2)
+    return ggml_cuda_mmq_get_config_gfx1030(type, J, fallback);
 #else
     return ggml_cuda_mmq_get_config_rdna2(type, J, fallback);
 #endif // CDNA
@@ -1500,10 +1506,10 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
 
         const int ntiles_x = (args.ncols_max + config.J - 1) / config.J;
 
-        // gfx906: do not widen J past 64 if the tile grid can no longer fill the
-        // CUs - this is what regresses -sm tensor (rows sharded) and MoE (tiny
-        // per-expert shapes). Keep total tiles >= nsm.
-        if (cc == GGML_CUDA_CC_VEGA20 && config.J > 64) {
+        // gfx906 / rdna2: do not widen J past 64 if the tile grid can no longer
+        // fill the CUs - this is what regresses -sm tensor (rows sharded) and MoE
+        // (tiny per-expert shapes). Keep total tiles >= nsm.
+        if ((cc == GGML_CUDA_CC_VEGA20 || GGML_CUDA_CC_IS_RDNA2(cc)) && config.J > 64) {
             // MoE (ids): tiny per-expert shape never benefits from wide tiles, and
             // the total-tiles heuristic overcounts it - always cap MoE at J=64.
             if (args.ids_dst != nullptr) { continue; }
